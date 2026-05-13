@@ -1,0 +1,248 @@
+name: Free Stock Image Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Image Source'
+        required: true
+        type: choice
+        options:
+          - pexels
+          - pixabay
+          - unsplash
+        default: 'pexels'
+      search_query:
+        description: 'Search term (e.g., mountain landscape)'
+        required: true
+        type: string
+        default: 'nature'
+      max_images:
+        description: 'Number of images to download (max 80)'
+        required: false
+        type: number
+        default: 10
+      upload_method:
+        description: 'Save method'
+        required: true
+        type: choice
+        options:
+          - repository (push to repo)
+          - release (GitHub Releases)
+        default: 'repository (push to repo)'
+      release_tag:
+        description: 'Release tag (if Releases method is chosen)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download-stock-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📂 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 🔧 Install Dependencies
+        run: |
+          pip install requests pillow
+
+      - name: 🎨 Download Images from Stock Site
+        id: download
+        run: |
+          python3 << 'EOF'
+          import os, sys, requests, json
+          from pathlib import Path
+          from urllib.parse import urlparse
+          import time
+
+          SOURCE = os.environ.get('INPUT_SOURCE')
+          QUERY = os.environ.get('INPUT_QUERY')
+          MAX_IMAGES = int(os.environ.get('INPUT_MAX_IMAGES', 10))
+
+          # Limit to API maximums
+          if MAX_IMAGES > 80:
+              MAX_IMAGES = 80
+
+          # Create dated output directory
+          from datetime import datetime
+          date_str = datetime.now().strftime('%Y-%m-%d')
+          output_dir = f"stock_images/{date_str}_{QUERY.replace(' ', '_')}"
+          Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+          downloaded = 0
+
+          # ----- PEXELS -----
+          if SOURCE == 'pexels':
+              api_key = os.environ.get('PEXELS_API_KEY')
+              if not api_key:
+                  print("::error::PEXELS_API_KEY secret not set!")
+                  sys.exit(1)
+
+              headers = {'Authorization': api_key}
+              url = f"https://api.pexels.com/v1/search?query={QUERY}&per_page={MAX_IMAGES}"
+
+              response = requests.get(url, headers=headers)
+              if response.status_code != 200:
+                  print(f"::error::Pexels API error: {response.status_code}")
+                  sys.exit(1)
+
+              data = response.json()
+              photos = data.get('photos', [])
+
+              for idx, photo in enumerate(photos, 1):
+                  img_url = photo.get('src', {}).get('original')
+                  if img_url:
+                      img_data = requests.get(img_url, timeout=30)
+                      if img_data.status_code == 200:
+                          filename = f"{output_dir}/pexels_{QUERY.replace(' ', '_')}_{idx:03d}.jpg"
+                          with open(filename, 'wb') as f:
+                              f.write(img_data.content)
+                          downloaded += 1
+                          print(f"✅ Downloaded: {filename}")
+                      time.sleep(0.5)  # Be polite to the API
+
+          # ----- PIXABAY -----
+          elif SOURCE == 'pixabay':
+              api_key = os.environ.get('PIXABAY_API_KEY')
+              if not api_key:
+                  print("::error::PIXABAY_API_KEY secret not set!")
+                  sys.exit(1)
+
+              url = f"https://pixabay.com/api/?key={api_key}&q={QUERY}&image_type=photo&per_page={MAX_IMAGES}"
+
+              response = requests.get(url)
+              if response.status_code != 200:
+                  print(f"::error::Pixabay API error: {response.status_code}")
+                  sys.exit(1)
+
+              data = response.json()
+              hits = data.get('hits', [])
+
+              for idx, hit in enumerate(hits, 1):
+                  img_url = hit.get('largeImageURL')
+                  if img_url:
+                      img_data = requests.get(img_url, timeout=30)
+                      if img_data.status_code == 200:
+                          filename = f"{output_dir}/pixabay_{QUERY.replace(' ', '_')}_{idx:03d}.jpg"
+                          with open(filename, 'wb') as f:
+                              f.write(img_data.content)
+                          downloaded += 1
+                          print(f"✅ Downloaded: {filename}")
+                      time.sleep(0.5)
+
+          # ----- UNSPLASH -----
+          elif SOURCE == 'unsplash':
+              api_key = os.environ.get('UNSPLASH_API_KEY')
+              if not api_key:
+                  print("::error::UNSPLASH_API_KEY secret not set!")
+                  sys.exit(1)
+
+              # Unsplash requires per_page (max 30) and pagination
+              per_page = min(MAX_IMAGES, 30)
+              pages = (MAX_IMAGES + per_page - 1) // per_page
+
+              for page in range(1, pages + 1):
+                  url = f"https://api.unsplash.com/search/photos?query={QUERY}&per_page={per_page}&page={page}"
+                  headers = {'Authorization': f'Client-ID {api_key}'}
+
+                  response = requests.get(url, headers=headers)
+                  if response.status_code != 200:
+                      print(f"::error::Unsplash API error: {response.status_code}")
+                      sys.exit(1)
+
+                  data = response.json()
+                  results = data.get('results', [])
+
+                  for idx, result in enumerate(results, 1):
+                      if downloaded >= MAX_IMAGES:
+                          break
+                      img_url = result.get('urls', {}).get('raw') or result.get('urls', {}).get('full')
+                      if img_url:
+                          img_data = requests.get(img_url, timeout=30)
+                          if img_data.status_code == 200:
+                              filename = f"{output_dir}/unsplash_{QUERY.replace(' ', '_')}_{downloaded+1:03d}.jpg"
+                              with open(filename, 'wb') as f:
+                                  f.write(img_data.content)
+                              downloaded += 1
+                              print(f"✅ Downloaded: {filename}")
+                          time.sleep(0.5)
+                  if downloaded >= MAX_IMAGES:
+                      break
+
+          print(f"🎯 Downloaded {downloaded} images to {output_dir}")
+
+          # Save output for later steps
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"count={downloaded}\n")
+              f.write(f"dir={output_dir}\n")
+          EOF
+        env:
+          INPUT_SOURCE: ${{ github.event.inputs.source }}
+          INPUT_QUERY: ${{ github.event.inputs.search_query }}
+          INPUT_MAX_IMAGES: ${{ github.event.inputs.max_images }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          UNSPLASH_API_KEY: ${{ secrets.UNSPLASH_API_KEY }}
+
+      - name: 📦 Prepare files for upload
+        if: steps.download.outputs.count > 0
+        run: |
+          mkdir -p release_files
+          cp -r ${{ steps.download.outputs.dir }} release_files/
+          echo "Contents to upload:"
+          ls -la release_files/
+
+      - name: 📅 Get Current Date
+        id: get_date
+        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: 📤 Push to Repository
+        if: github.event.inputs.upload_method == 'repository (push to repo)' && steps.download.outputs.count > 0
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -d release_files/stock_images ]; then
+            cp -r release_files/stock_images/* stock_images/ 2>/dev/null || mkdir -p stock_images && cp -r release_files/stock_images/* stock_images/
+            git add stock_images/
+            git commit -m "📸 Stock images: ${{ github.event.inputs.source }} - ${{ github.event.inputs.search_query }} (${{ steps.download.outputs.count }} images) [skip ci]" || echo "Nothing to commit"
+            git push
+          fi
+
+      - name: 📤 Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release (GitHub Releases)' && steps.download.outputs.count > 0
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('stock-{0}', github.run_number) }}
+          name: ${{ format('Stock Images - {0}', github.event.inputs.search_query) }}
+          body: |
+            **Stock Image Download**
+
+            **Source:** ${{ github.event.inputs.source }}
+            **Search Query:** ${{ github.event.inputs.search_query }}
+            **Images Downloaded:** ${{ steps.download.outputs.count }}
+            **Date:** ${{ steps.get_date.outputs.date }}
+
+            ---
+            Powered by GitHub Actions
+          files: release_files/stock_images/**
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: rm -rf release_files 2>/dev/null || true
