@@ -1,4 +1,4 @@
-name: Pinterest Search & Download
+name: Pinterest Search & Download (Zipped)
 
 on:
   workflow_dispatch:
@@ -59,8 +59,7 @@ jobs:
     - name: 🔧 Install Dependencies
       run: |
         pip install pinterest-dl
-        # ffmpeg is required for video downloading
-        sudo apt-get update && sudo apt-get install -y ffmpeg
+        sudo apt-get update && sudo apt-get install -y ffmpeg zip
 
     - name: 🧠 Run Pinterest Search & Download
       id: download
@@ -70,22 +69,16 @@ jobs:
         from pathlib import Path
         from pinterest_dl import PinterestDL
 
-        # Get inputs from environment
         QUERY = os.environ.get('INPUT_QUERY')
         MAX_ITEMS = int(os.environ.get('INPUT_MAX_ITEMS', 10))
         OUTPUT_FORMAT = os.environ.get('INPUT_FORMAT', 'both')
         OUTPUT_DIR = "pinterest_results"
 
-        # Ensure output directory exists
         Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-        # Function to check if we've reached our count for a type
-        def count_files(directory, extension):
-            count = len(list(Path(directory).glob(extension)))
-            print(f"Found {count} files with {extension}")
-            return count
+        image_count = 0
+        video_count = 0
 
-        # Download images
         if OUTPUT_FORMAT in ['both', 'images']:
             try:
                 print(f"🔍 Searching Pinterest for images: '{QUERY}'")
@@ -94,13 +87,13 @@ jobs:
                     query=QUERY,
                     output_dir=OUTPUT_DIR,
                     num=MAX_ITEMS,
-                    download_streams=False,  # Only download images
+                    download_streams=False,
                 )
-                print(f"✅ Downloaded {len(images)} images" if images else "✅ Image download completed")
+                image_count = len(images) if images else 0
+                print(f"✅ Downloaded {image_count} images")
             except Exception as e:
                 print(f"⚠️ Error downloading images: {e}")
 
-        # Download videos
         if OUTPUT_FORMAT in ['both', 'videos']:
             try:
                 print(f"🔍 Searching Pinterest for videos: '{QUERY}'")
@@ -109,42 +102,60 @@ jobs:
                     query=QUERY,
                     output_dir=OUTPUT_DIR,
                     num=MAX_ITEMS,
-                    download_streams=True,  # Download video streams
+                    download_streams=True,
                 )
-                print(f"✅ Downloaded {len(videos)} videos" if videos else "✅ Video download completed")
+                video_count = len(videos) if videos else 0
+                print(f"✅ Downloaded {video_count} videos")
             except Exception as e:
                 print(f"⚠️ Error downloading videos: {e}")
 
-        # Verify downloads
-        image_count = count_files(OUTPUT_DIR, "*.jpg")
-        image_count += count_files(OUTPUT_DIR, "*.png")
-        video_count = count_files(OUTPUT_DIR, "*.mp4")
-        print(f"🎯 Final results: {image_count} images, {video_count} videos in '{OUTPUT_DIR}'")
+        total_files = image_count + video_count
+        print(f"🎯 Total files downloaded: {total_files}")
 
-        # Set output for GitHub Actions
-        github_output = os.getenv('GITHUB_OUTPUT')
-        if github_output:
-            with open(github_output, 'a') as f:
-                f.write(f"image_count={image_count}\n")
-                f.write(f"video_count={video_count}\n")
+        # Save counts for later use
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"total_files={total_files}\n")
+            f.write(f"image_count={image_count}\n")
+            f.write(f"video_count={video_count}\n")
         EOF
       env:
         INPUT_QUERY: ${{ github.event.inputs.search_query }}
         INPUT_MAX_ITEMS: ${{ github.event.inputs.max_items }}
         INPUT_FORMAT: ${{ github.event.inputs.output_format }}
 
-    - name: 📦 Prepare files for upload
-      if: always()
+    - name: 📦 Zip & Split (if needed)
       run: |
+        # Sanitize search query for filename
+        SAFE_NAME=$(echo "${{ github.event.inputs.search_query }}" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-50)
+        TOTAL_FILES="${{ steps.download.outputs.total_files }}"
+        ZIP_NAME="${SAFE_NAME}_${TOTAL_FILES}.zip"
+
+        echo "Creating zip archive: $ZIP_NAME"
+        cd pinterest_results
+        zip -r "../$ZIP_NAME" .
+
+        cd ..
+        THRESH_MB=90
+        FILESIZE=$(stat -c%s "$ZIP_NAME" 2>/dev/null || echo 0)
+        THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
+
         mkdir -p release_files
-        if [ -d "pinterest_results" ] && [ "$(ls -A pinterest_results)" ]; then
-          mv pinterest_results/* release_files/
-          echo "Moved files to release_files directory"
+
+        if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
+          echo "🔪 Zip file is larger than 90MB, splitting into ${THRESH_MB}MB parts..."
+          BASE="${ZIP_NAME%.zip}"
+          zip -r -s "${THRESH_MB}m" "${BASE}.zip" "pinterest_results"  # re-zip with split
+          # The split command creates files like ${BASE}.z01, .z02, .zip
+          mv "${BASE}.z"* release_files/ 2>/dev/null || true
+          rm -f "$ZIP_NAME"
+          echo "Split parts moved to release_files/"
         else
-          echo "No files were downloaded, creating empty directory"
-          touch release_files/.empty
+          mv "$ZIP_NAME" release_files/
+          echo "Moved single zip file to release_files/"
         fi
-        echo "Final contents:"
+
+        # Also move any leftover individual files? Not needed because we zipped everything.
+        echo "Contents of release_files:"
         ls -la release_files/
 
     - name: 📅 Get Current Date
@@ -157,13 +168,11 @@ jobs:
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         mkdir -p downloads
-        if [ -d release_files ] && [ "$(ls -A release_files)" ]; then
-          mv release_files/* downloads/
-        fi
+        mv release_files/* downloads/
         echo "Contents of downloads folder:"
         ls -la downloads/
         git add downloads/
-        git commit -m "Pinterest Search: ${{ github.event.inputs.search_query }}" || echo "Nothing to commit"
+        git commit -m "Pinterest: ${{ github.event.inputs.search_query }} (${{ steps.download.outputs.total_files }} items) [skip ci]" || echo "Nothing to commit"
         git push
 
     - name: 📤 Upload to GitHub Releases
@@ -171,19 +180,17 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('pinterest-{0}', github.run_number) }}
-        name: ${{ format('Pinterest Search - {0}', github.event.inputs.search_query) }}
+        name: ${{ format('Pinterest - {0}', github.event.inputs.search_query) }}
         body: |
           **Pinterest Search Results**
 
-          **Search Query:** ${{ github.event.inputs.search_query }}
-          **Max Items:** ${{ github.event.inputs.max_items }}
-          **Media Type:** ${{ github.event.inputs.output_format }}
-          **Images Downloaded:** ${{ steps.download.outputs.image_count }}
-          **Videos Downloaded:** ${{ steps.download.outputs.video_count }}
+          **Query:** ${{ github.event.inputs.search_query }}
+          **Max items:** ${{ github.event.inputs.max_items }}
+          **Type:** ${{ github.event.inputs.output_format }}
+          **Total files:** ${{ steps.download.outputs.total_files }} (images: ${{ steps.download.outputs.image_count }}, videos: ${{ steps.download.outputs.video_count }})
           **Date:** ${{ steps.get_date.outputs.date }}
 
-          ---
-          Powered by GitHub Actions & pinterest-dl
+          **Download:** The zip archive (or split parts) is attached below.
         files: release_files/*
         token: ${{ secrets.GITHUB_TOKEN }}
         draft: false
@@ -191,4 +198,4 @@ jobs:
 
     - name: 🧹 Cleanup
       if: always()
-      run: rm -rf release_files pinterest_results 2>/dev/null || true
+      run: rm -rf release_files pinterest_results *.zip 2>/dev/null || true
