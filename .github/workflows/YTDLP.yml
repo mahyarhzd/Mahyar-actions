@@ -1,4 +1,4 @@
-name: YouTube Downloader Pro (with working subtitles)
+name: YouTube Downloader Pro (Fixed Subtitles)
 
 on:
   workflow_dispatch:
@@ -80,7 +80,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y zip curl python3 python3-pip
-          pip3 install --quiet requests youtube_transcript_api
+          # Pin to a stable version of youtube_transcript_api
+          pip3 install --quiet requests youtube_transcript_api==0.6.1
 
       - name: 🧠 Process Video & Subtitles
         id: retrieve
@@ -101,28 +102,34 @@ jobs:
               sys.exit(1)
           video_id = vid_match[1]
 
-          # ---------- SUBTITLE DOWNLOAD (always attempt if requested) ----------
+          # ---------- SUBTITLE DOWNLOAD (Fixed for library version 0.6.1) ----------
           subtitle_filename = None
           subtitle_saved = False
 
           if GET_SUB or MODE == 'subtitles only':
               try:
+                  # Use the old working API (version 0.6.1)
                   transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                  # Prefer manually created English, fallback to auto-generated
-                  transcript = transcript_list.find_transcript(['en'])
-                  srt_formatter = SRTFormatter()
-                  srt_content = srt_formatter.format_transcript(transcript.fetch())
-                  subtitle_filename = f"{video_id}_en.srt"
-                  with open(subtitle_filename, 'w', encoding='utf-8') as f:
-                      f.write(srt_content)
-                  subtitle_saved = True
-                  print(f"✅ Subtitles saved as {subtitle_filename}")
-                  # Verify file exists
-                  if os.path.exists(subtitle_filename):
-                      print(f"✅ Confirmed: {subtitle_filename} exists ({os.path.getsize(subtitle_filename)} bytes)")
+                  # Try to get English transcript (manual or auto-generated)
+                  transcript = None
+                  try:
+                      transcript = transcript_list.find_transcript(['en'])
+                  except:
+                      # If no English, take the first available
+                      for t in transcript_list:
+                          transcript = t
+                          break
+                  if transcript:
+                      srt_formatter = SRTFormatter()
+                      srt_content = srt_formatter.format_transcript(transcript.fetch())
+                      subtitle_filename = f"{video_id}_en.srt"
+                      with open(subtitle_filename, 'w', encoding='utf-8') as f:
+                          f.write(srt_content)
+                      subtitle_saved = True
+                      print(f"✅ Subtitles saved as {subtitle_filename}")
+                      print(f"✅ File size: {os.path.getsize(subtitle_filename)} bytes")
                   else:
-                      print(f"::error::File {subtitle_filename} was not created!")
-                      sys.exit(1)
+                      raise Exception("No transcript found")
               except Exception as e:
                   print(f"⚠️ Could not download subtitles: {e}")
                   if MODE == 'subtitles only':
@@ -227,11 +234,11 @@ jobs:
             exit 1
           fi
 
-      # ---------- FORCE MOVE SUBTITLES TO release_files (if any) ----------
+      # ---------- FORCE MOVE SUBTITLES TO release_files ----------
       - name: 📝 Move Subtitles to release_files
         run: |
           mkdir -p release_files
-          # Look for any .srt file in the current directory (created by Python)
+          # Look for any .srt file in the current directory
           for srt in *.srt; do
             if [ -f "$srt" ]; then
               echo "Found subtitle file: $srt"
@@ -239,7 +246,7 @@ jobs:
               echo "Moved to release_files/"
             fi
           done
-          # Also check if subtitle filename is stored in .download_info and move it
+          # Also check .download_info for stored filename
           if grep -q "subtitle_filename=" .download_info 2>/dev/null; then
             SUB_FILE=$(grep "subtitle_filename=" .download_info | cut -d'=' -f2)
             if [ -f "$SUB_FILE" ]; then
