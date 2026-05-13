@@ -8,9 +8,19 @@ on:
         required: true
         type: string
 
-      output_format:
-        description: 'Output format'
+      # ---------- NEW: Download Mode ----------
+      download_mode:
+        description: 'What to download?'
         required: true
+        type: choice
+        options:
+          - video/audio + subtitles (if available)
+          - subtitles only (no video/audio)
+        default: 'video/audio + subtitles (if available)'
+
+      output_format:
+        description: 'Output format (only for video/audio mode)'
+        required: false
         type: choice
         options:
           - mp4 (video)
@@ -18,13 +28,13 @@ on:
         default: 'mp4 (video)'
 
       desired_quality:
-        description: 'Video: 720p, 1080p | Audio: 192kbps, 320kbps'
+        description: 'Quality: 720p/1080p for video, 192/320kbps for audio'
         required: false
         type: string
         default: '720p'
 
       max_part_mb:
-        description: 'Max size per part (MB) - 0 = auto 1800 MB'
+        description: 'Max size per part (MB) - 0 = auto 1800 MB (ignored for subtitles-only)'
         required: false
         type: string
         default: '90'
@@ -44,15 +54,14 @@ on:
         type: string
         default: ''
 
-      # ---------- NEW FEATURE: Subtitle Options ----------
       download_subtitles:
-        description: 'Download English subtitles?'
+        description: 'Download English subtitles? (ignored if mode is subtitles-only)'
         required: false
         type: choice
         options:
           - 'no'
           - 'yes, as .srt file'
-        default: 'no'
+        default: 'yes, as .srt file'
 
 permissions:
   contents: write
@@ -72,58 +81,75 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y zip curl python3 python3-pip
-          # ---------- NEW: Install subtitle library ----------
           pip3 install --quiet requests youtube_transcript_api
 
-      - name: 🔗 Get Download Link
+      - name: 🧠 Process Video & Subtitles (or just subtitles)
         id: retrieve
         run: |
           python3 << 'EOF'
           import os, sys, time, re, requests
-          # ---------- NEW: For subtitles ----------
           from youtube_transcript_api import YouTubeTranscriptApi
           from youtube_transcript_api.formatters import SRTFormatter
 
-          URL  = os.environ.get('INPUT_URL')
-          FMT  = os.environ.get('INPUT_FORMAT')
-          QUAL = os.environ.get('INPUT_QUALITY')
+          URL = os.environ.get('INPUT_URL')
+          MODE = os.environ.get('INPUT_MODE')  # 'video/audio+subtitles' or 'subtitles only'
           GET_SUB = os.environ.get('INPUT_SUBTITLES') == 'yes, as .srt file'
 
-          # Extract video ID from URL
+          # Extract video ID
           vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)
           if not vid_match:
               print("::error::Could not extract video ID from URL")
               sys.exit(1)
           video_id = vid_match[1]
 
+          # ---------- ALWAYS try to get subtitles if requested ----------
+          subtitle_filename = None
+          subtitle_saved = False
+          if GET_SUB or MODE == 'subtitles only':
+              try:
+                  transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                  # Prefer manually created English, fallback to auto-generated
+                  try:
+                      transcript = transcript_list.find_transcript(['en'])
+                  except:
+                      # Try auto-generated English
+                      transcript = transcript_list.find_transcript(['en'])
+                  srt_formatter = SRTFormatter()
+                  srt_content = srt_formatter.format_transcript(transcript.fetch())
+                  subtitle_filename = f"{video_id}_en.srt"
+                  with open(subtitle_filename, 'w', encoding='utf-8') as f:
+                      f.write(srt_content)
+                  subtitle_saved = True
+                  print(f"✅ English subtitles saved as {subtitle_filename}")
+              except Exception as e:
+                  print(f"⚠️ Could not download subtitles: {e}")
+                  if MODE == 'subtitles only':
+                      print("::error::Subtitles not available and mode requires only subtitles.")
+                      sys.exit(1)
+
+          # ---------- If mode is subtitles only, skip video download ----------
+          if MODE == 'subtitles only':
+              # Write only subtitle info
+              with open(".download_info", "w", encoding="utf-8") as f:
+                  f.write("SUBTITLES_ONLY\n")
+                  f.write(f"subtitle_saved={subtitle_saved}\n")
+                  if subtitle_saved:
+                      f.write(f"subtitle_filename={subtitle_filename}\n")
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write(f"mode=subtitles_only\n")
+                  f.write(f"subtitle_saved={'true' if subtitle_saved else 'false'}\n")
+              print("Subtitle-only mode completed.")
+              sys.exit(0)
+
+          # ---------- Otherwise (video/audio mode) proceed with download link ----------
+          FMT = os.environ.get('INPUT_FORMAT')
+          QUAL = os.environ.get('INPUT_QUALITY')
           is_audio = FMT == 'mp3'
           if is_audio:
               QUAL = QUAL if QUAL in ('64kbps','128kbps','192kbps','320kbps') else '192kbps'
           else:
               QUAL = QUAL if QUAL in ('720p','1080p') else '720p'
 
-          # ---------- NEW: Subtitle download logic ----------
-          subtitle_saved = False
-          if GET_SUB:
-              try:
-                  transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                  # Try to find a manually created English transcript first
-                  transcript = transcript_list.find_transcript(['en'])
-                  # Or use auto-generated if manual isn't available
-                  # transcript = transcript_list.find_transcript(['en'])
-
-                  srt_formatter = SRTFormatter()
-                  srt_content = srt_formatter.format_transcript(transcript.fetch())
-
-                  subtitle_filename = f"{video_id}_en.srt"
-                  with open(subtitle_filename, 'w', encoding='utf-8') as sub_f:
-                      sub_f.write(srt_content)
-                  subtitle_saved = True
-                  print(f"✅ English subtitles saved as {subtitle_filename}")
-              except Exception as e:
-                  print(f"⚠️ Could not download subtitles: {e}. Continuing without them.")
-
-          # ---------- Original Video Download API Logic ----------
           payload = {
               "url": URL,
               "os": "linux",
@@ -137,14 +163,12 @@ jobs:
           s = requests.Session()
           s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
           s.get("https://media.ytmp3.gg/")
-
           resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
           resp.raise_for_status()
           data = resp.json()
 
           status_url = data.get('statusUrl')
           title = data.get('title', 'video')
-
           dl_url = None
           for _ in range(150):
               time.sleep(2)
@@ -166,9 +190,9 @@ jobs:
           clean = clean.lstrip('-')
           fname = f"{clean}_{video_id}_{QUAL}.{FMT}"
 
-          # Write download info and subtitle flag
           with open(".download_info", "w", encoding="utf-8") as f:
               f.write(f"{dl_url}\n{fname}\n{title}\n")
+              f.write(f"mode=video\n")
               f.write(f"subtitle_saved={subtitle_saved}\n")
               if subtitle_saved:
                   f.write(f"subtitle_filename={subtitle_filename}\n")
@@ -176,16 +200,19 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"filename={fname}\n")
               f.write(f"title={title}\n")
+              f.write(f"mode=video\n")
               f.write(f"subtitle_saved={'true' if subtitle_saved else 'false'}\n")
           EOF
         env:
           INPUT_URL:         ${{ github.event.inputs.video_url }}
+          INPUT_MODE:        ${{ github.event.inputs.download_mode }}
           INPUT_FORMAT:      ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
           INPUT_QUALITY:     ${{ github.event.inputs.desired_quality }}
-          # ---------- NEW: Pass subtitle option ----------
           INPUT_SUBTITLES:   ${{ github.event.inputs.download_subtitles }}
 
+      # ---------- DOWNLOAD VIDEO/AUDIO (if not subtitles-only) ----------
       - name: 📥 Download File
+        if: steps.retrieve.outputs.mode != 'subtitles_only'
         run: |
           DL_URL=$(head -1 .download_info)
           FILENAME=$(sed -n '2p' .download_info)
@@ -197,20 +224,23 @@ jobs:
             exit 1
           fi
 
-      # ---------- NEW: Include Subtitles in Release ----------
-      - name: 📝 Include Subtitles in Release
+      # ---------- INCLUDE SUBTITLES (if any) ----------
+      - name: 📝 Prepare Subtitles for Upload
         if: steps.retrieve.outputs.subtitle_saved == 'true'
         run: |
-          # Find subtitle file and move to release_files
+          # Extract subtitle filename from .download_info
           SUB_FILE=$(grep "subtitle_filename=" .download_info | cut -d'=' -f2)
           if [ -f "$SUB_FILE" ]; then
+            mkdir -p release_files
             mv "$SUB_FILE" release_files/
-            echo "📝 Included subtitles: $SUB_FILE"
+            echo "📝 Subtitles added: $SUB_FILE"
           else
             echo "⚠️ Subtitle file not found, skipping."
           fi
 
+      # ---------- SPLIT VIDEO (only if video mode and file large) ----------
       - name: ✂️ Split Large File (if needed)
+        if: steps.retrieve.outputs.mode != 'subtitles_only'
         run: |
           FILENAME="${{ steps.retrieve.outputs.filename }}"
           THRESH_MB="${{ github.event.inputs.max_part_mb }}"
@@ -237,35 +267,41 @@ jobs:
         id: get_date
         run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
 
+      # ---------- PUSH TO REPOSITORY (handles both modes correctly) ----------
       - name: 📤 Push to Repository
         if: github.event.inputs.upload_method == 'repository (push to repo)'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           mkdir -p downloads
-          mv release_files/* downloads/
+          if [ -d release_files ] && [ "$(ls -A release_files)" ]; then
+            mv release_files/* downloads/
+          fi
+          # In subtitles-only mode, the subtitle file might have been left in current dir
+          if [ -f *.srt ] 2>/dev/null; then
+            mv *.srt downloads/
+          fi
           git add downloads/
-          git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+          git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename || 'subtitles-only' }} [skip ci]" || echo "Nothing to commit"
           git push
 
+      # ---------- UPLOAD TO RELEASES (handles both modes) ----------
       - name: 📤 Upload to GitHub Releases
         if: github.event.inputs.upload_method == 'release (GitHub Releases)'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
-          name: ${{ format('YouTube - {0}', steps.retrieve.outputs.filename) }}
+          name: ${{ steps.retrieve.outputs.mode == 'subtitles_only' && format('Subtitles - {0}', github.event.inputs.video_url) || format('YouTube - {0}', steps.retrieve.outputs.filename) }}
           body: |
             **📽️ YouTube Download**
 
-            **Title:** ${{ steps.retrieve.outputs.title }}
-            **Original Link:** ${{ github.event.inputs.video_url }}
-            **Quality:** ${{ github.event.inputs.desired_quality }}
-            **Format:** ${{ github.event.inputs.output_format }}
-            ${{ steps.retrieve.outputs.subtitle_saved == 'true' && '**🔤 Subtitles:** English subtitles are included as a .srt file.' || '' }}
+            **URL:** ${{ github.event.inputs.video_url }}
+            **Mode:** ${{ github.event.inputs.download_mode }}
+            ${{ steps.retrieve.outputs.subtitle_saved == 'true' && '**🔤 Subtitles:** English subtitles are attached as .srt file.' || '' }}
             **Downloaded on:** ${{ steps.get_date.outputs.date }}
 
             ---
-            Powered by Meli-Action ⚡
+            Powered by Enhanced YouTube Action
           files: release_files/*
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
@@ -273,4 +309,4 @@ jobs:
 
       - name: 🧹 Cleanup
         if: always()
-        run: rm -rf release_files .download_info 2>/dev/null || true
+        run: rm -rf release_files .download_info *.srt 2>/dev/null || true
