@@ -1,0 +1,194 @@
+name: Pinterest Search & Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: 'Search term for Pinterest'
+        required: true
+        type: string
+        default: 'nature landscape'
+      max_items:
+        description: 'Number of images/videos to download'
+        required: false
+        type: number
+        default: 10
+      output_format:
+        description: 'Media type to download'
+        required: true
+        type: choice
+        default: 'both'
+        options:
+          - both
+          - images
+          - videos
+      upload_method:
+        description: 'Save method'
+        required: true
+        type: choice
+        options:
+          - repository (push to repo)
+          - release (GitHub Releases)
+        default: 'repository (push to repo)'
+      release_tag:
+        description: 'Release tag (if Releases method is chosen)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  pinterest-scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - name: 📂 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: 🔧 Install Dependencies
+      run: |
+        pip install pinterest-dl
+        # ffmpeg is required for video downloading
+        sudo apt-get update && sudo apt-get install -y ffmpeg
+
+    - name: 🧠 Run Pinterest Search & Download
+      id: download
+      run: |
+        python3 << 'EOF'
+        import os
+        from pathlib import Path
+        from pinterest_dl import PinterestDL
+
+        # Get inputs from environment
+        QUERY = os.environ.get('INPUT_QUERY')
+        MAX_ITEMS = int(os.environ.get('INPUT_MAX_ITEMS', 10))
+        OUTPUT_FORMAT = os.environ.get('INPUT_FORMAT', 'both')
+        OUTPUT_DIR = "pinterest_results"
+
+        # Ensure output directory exists
+        Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+        # Function to check if we've reached our count for a type
+        def count_files(directory, extension):
+            count = len(list(Path(directory).glob(extension)))
+            print(f"Found {count} files with {extension}")
+            return count
+
+        # Download images
+        if OUTPUT_FORMAT in ['both', 'images']:
+            try:
+                print(f"🔍 Searching Pinterest for images: '{QUERY}'")
+                image_downloader = PinterestDL.with_api()
+                images = image_downloader.search_and_download(
+                    query=QUERY,
+                    output_dir=OUTPUT_DIR,
+                    num=MAX_ITEMS,
+                    download_streams=False,  # Only download images
+                )
+                print(f"✅ Downloaded {len(images)} images" if images else "✅ Image download completed")
+            except Exception as e:
+                print(f"⚠️ Error downloading images: {e}")
+
+        # Download videos
+        if OUTPUT_FORMAT in ['both', 'videos']:
+            try:
+                print(f"🔍 Searching Pinterest for videos: '{QUERY}'")
+                video_downloader = PinterestDL.with_api()
+                videos = video_downloader.search_and_download(
+                    query=QUERY,
+                    output_dir=OUTPUT_DIR,
+                    num=MAX_ITEMS,
+                    download_streams=True,  # Download video streams
+                )
+                print(f"✅ Downloaded {len(videos)} videos" if videos else "✅ Video download completed")
+            except Exception as e:
+                print(f"⚠️ Error downloading videos: {e}")
+
+        # Verify downloads
+        image_count = count_files(OUTPUT_DIR, "*.jpg")
+        image_count += count_files(OUTPUT_DIR, "*.png")
+        video_count = count_files(OUTPUT_DIR, "*.mp4")
+        print(f"🎯 Final results: {image_count} images, {video_count} videos in '{OUTPUT_DIR}'")
+
+        # Set output for GitHub Actions
+        github_output = os.getenv('GITHUB_OUTPUT')
+        if github_output:
+            with open(github_output, 'a') as f:
+                f.write(f"image_count={image_count}\n")
+                f.write(f"video_count={video_count}\n")
+        EOF
+      env:
+        INPUT_QUERY: ${{ github.event.inputs.search_query }}
+        INPUT_MAX_ITEMS: ${{ github.event.inputs.max_items }}
+        INPUT_FORMAT: ${{ github.event.inputs.output_format }}
+
+    - name: 📦 Prepare files for upload
+      if: always()
+      run: |
+        mkdir -p release_files
+        if [ -d "pinterest_results" ] && [ "$(ls -A pinterest_results)" ]; then
+          mv pinterest_results/* release_files/
+          echo "Moved files to release_files directory"
+        else
+          echo "No files were downloaded, creating empty directory"
+          touch release_files/.empty
+        fi
+        echo "Final contents:"
+        ls -la release_files/
+
+    - name: 📅 Get Current Date
+      id: get_date
+      run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+    - name: 📤 Push to Repository
+      if: github.event.inputs.upload_method == 'repository (push to repo)'
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        mkdir -p downloads
+        if [ -d release_files ] && [ "$(ls -A release_files)" ]; then
+          mv release_files/* downloads/
+        fi
+        echo "Contents of downloads folder:"
+        ls -la downloads/
+        git add downloads/
+        git commit -m "Pinterest Search: ${{ github.event.inputs.search_query }}" || echo "Nothing to commit"
+        git push
+
+    - name: 📤 Upload to GitHub Releases
+      if: github.event.inputs.upload_method == 'release (GitHub Releases)'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('pinterest-{0}', github.run_number) }}
+        name: ${{ format('Pinterest Search - {0}', github.event.inputs.search_query) }}
+        body: |
+          **Pinterest Search Results**
+
+          **Search Query:** ${{ github.event.inputs.search_query }}
+          **Max Items:** ${{ github.event.inputs.max_items }}
+          **Media Type:** ${{ github.event.inputs.output_format }}
+          **Images Downloaded:** ${{ steps.download.outputs.image_count }}
+          **Videos Downloaded:** ${{ steps.download.outputs.video_count }}
+          **Date:** ${{ steps.get_date.outputs.date }}
+
+          ---
+          Powered by GitHub Actions & pinterest-dl
+        files: release_files/*
+        token: ${{ secrets.GITHUB_TOKEN }}
+        draft: false
+        prerelease: false
+
+    - name: 🧹 Cleanup
+      if: always()
+      run: rm -rf release_files pinterest_results 2>/dev/null || true
