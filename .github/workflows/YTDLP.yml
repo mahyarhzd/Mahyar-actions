@@ -1,4 +1,4 @@
-name: YouTube Downloader Pro
+name: YouTube Downloader Pro (with working subtitles)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,6 @@ on:
         required: true
         type: string
 
-      # ---------- NEW: Download Mode ----------
       download_mode:
         description: 'What to download?'
         required: true
@@ -83,7 +82,7 @@ jobs:
           sudo apt-get install -y zip curl python3 python3-pip
           pip3 install --quiet requests youtube_transcript_api
 
-      - name: 🧠 Process Video & Subtitles (or just subtitles)
+      - name: 🧠 Process Video & Subtitles
         id: retrieve
         run: |
           python3 << 'EOF'
@@ -92,7 +91,7 @@ jobs:
           from youtube_transcript_api.formatters import SRTFormatter
 
           URL = os.environ.get('INPUT_URL')
-          MODE = os.environ.get('INPUT_MODE')  # 'video/audio+subtitles' or 'subtitles only'
+          MODE = os.environ.get('INPUT_MODE')
           GET_SUB = os.environ.get('INPUT_SUBTITLES') == 'yes, as .srt file'
 
           # Extract video ID
@@ -102,46 +101,48 @@ jobs:
               sys.exit(1)
           video_id = vid_match[1]
 
-          # ---------- ALWAYS try to get subtitles if requested ----------
+          # ---------- SUBTITLE DOWNLOAD (always attempt if requested) ----------
           subtitle_filename = None
           subtitle_saved = False
+
           if GET_SUB or MODE == 'subtitles only':
               try:
                   transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
                   # Prefer manually created English, fallback to auto-generated
-                  try:
-                      transcript = transcript_list.find_transcript(['en'])
-                  except:
-                      # Try auto-generated English
-                      transcript = transcript_list.find_transcript(['en'])
+                  transcript = transcript_list.find_transcript(['en'])
                   srt_formatter = SRTFormatter()
                   srt_content = srt_formatter.format_transcript(transcript.fetch())
                   subtitle_filename = f"{video_id}_en.srt"
                   with open(subtitle_filename, 'w', encoding='utf-8') as f:
                       f.write(srt_content)
                   subtitle_saved = True
-                  print(f"✅ English subtitles saved as {subtitle_filename}")
+                  print(f"✅ Subtitles saved as {subtitle_filename}")
+                  # Verify file exists
+                  if os.path.exists(subtitle_filename):
+                      print(f"✅ Confirmed: {subtitle_filename} exists ({os.path.getsize(subtitle_filename)} bytes)")
+                  else:
+                      print(f"::error::File {subtitle_filename} was not created!")
+                      sys.exit(1)
               except Exception as e:
                   print(f"⚠️ Could not download subtitles: {e}")
                   if MODE == 'subtitles only':
                       print("::error::Subtitles not available and mode requires only subtitles.")
                       sys.exit(1)
 
-          # ---------- If mode is subtitles only, skip video download ----------
+          # If mode is subtitles only, we are done
           if MODE == 'subtitles only':
-              # Write only subtitle info
-              with open(".download_info", "w", encoding="utf-8") as f:
+              with open(".download_info", "w") as f:
                   f.write("SUBTITLES_ONLY\n")
                   f.write(f"subtitle_saved={subtitle_saved}\n")
                   if subtitle_saved:
                       f.write(f"subtitle_filename={subtitle_filename}\n")
               with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-                  f.write(f"mode=subtitles_only\n")
+                  f.write("mode=subtitles_only\n")
                   f.write(f"subtitle_saved={'true' if subtitle_saved else 'false'}\n")
-              print("Subtitle-only mode completed.")
+              print("Subtitle-only mode finished.")
               sys.exit(0)
 
-          # ---------- Otherwise (video/audio mode) proceed with download link ----------
+          # ---------- VIDEO/AUDIO MODE ----------
           FMT = os.environ.get('INPUT_FORMAT')
           QUAL = os.environ.get('INPUT_QUALITY')
           is_audio = FMT == 'mp3'
@@ -150,6 +151,7 @@ jobs:
           else:
               QUAL = QUAL if QUAL in ('720p','1080p') else '720p'
 
+          # Contact external API for download link
           payload = {
               "url": URL,
               "os": "linux",
@@ -190,6 +192,7 @@ jobs:
           clean = clean.lstrip('-')
           fname = f"{clean}_{video_id}_{QUAL}.{FMT}"
 
+          # Write all info to file
           with open(".download_info", "w", encoding="utf-8") as f:
               f.write(f"{dl_url}\n{fname}\n{title}\n")
               f.write(f"mode=video\n")
@@ -200,7 +203,7 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"filename={fname}\n")
               f.write(f"title={title}\n")
-              f.write(f"mode=video\n")
+              f.write("mode=video\n")
               f.write(f"subtitle_saved={'true' if subtitle_saved else 'false'}\n")
           EOF
         env:
@@ -210,7 +213,7 @@ jobs:
           INPUT_QUALITY:     ${{ github.event.inputs.desired_quality }}
           INPUT_SUBTITLES:   ${{ github.event.inputs.download_subtitles }}
 
-      # ---------- DOWNLOAD VIDEO/AUDIO (if not subtitles-only) ----------
+      # ---------- DOWNLOAD VIDEO/AUDIO ----------
       - name: 📥 Download File
         if: steps.retrieve.outputs.mode != 'subtitles_only'
         run: |
@@ -224,21 +227,30 @@ jobs:
             exit 1
           fi
 
-      # ---------- INCLUDE SUBTITLES (if any) ----------
-      - name: 📝 Prepare Subtitles for Upload
-        if: steps.retrieve.outputs.subtitle_saved == 'true'
+      # ---------- FORCE MOVE SUBTITLES TO release_files (if any) ----------
+      - name: 📝 Move Subtitles to release_files
         run: |
-          # Extract subtitle filename from .download_info
-          SUB_FILE=$(grep "subtitle_filename=" .download_info | cut -d'=' -f2)
-          if [ -f "$SUB_FILE" ]; then
-            mkdir -p release_files
-            mv "$SUB_FILE" release_files/
-            echo "📝 Subtitles added: $SUB_FILE"
-          else
-            echo "⚠️ Subtitle file not found, skipping."
+          mkdir -p release_files
+          # Look for any .srt file in the current directory (created by Python)
+          for srt in *.srt; do
+            if [ -f "$srt" ]; then
+              echo "Found subtitle file: $srt"
+              mv "$srt" release_files/
+              echo "Moved to release_files/"
+            fi
+          done
+          # Also check if subtitle filename is stored in .download_info and move it
+          if grep -q "subtitle_filename=" .download_info 2>/dev/null; then
+            SUB_FILE=$(grep "subtitle_filename=" .download_info | cut -d'=' -f2)
+            if [ -f "$SUB_FILE" ]; then
+              echo "Moving from stored filename: $SUB_FILE"
+              mv "$SUB_FILE" release_files/
+            fi
           fi
+          echo "Contents of release_files after moving subtitles:"
+          ls -la release_files/
 
-      # ---------- SPLIT VIDEO (only if video mode and file large) ----------
+      # ---------- SPLIT LARGE FILE (if needed) ----------
       - name: ✂️ Split Large File (if needed)
         if: steps.retrieve.outputs.mode != 'subtitles_only'
         run: |
@@ -267,25 +279,28 @@ jobs:
         id: get_date
         run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
 
-      # ---------- PUSH TO REPOSITORY (handles both modes correctly) ----------
+      # ---------- PUSH TO REPOSITORY ----------
       - name: 📤 Push to Repository
         if: github.event.inputs.upload_method == 'repository (push to repo)'
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           mkdir -p downloads
+          # Move everything from release_files to downloads
           if [ -d release_files ] && [ "$(ls -A release_files)" ]; then
             mv release_files/* downloads/
           fi
-          # In subtitles-only mode, the subtitle file might have been left in current dir
-          if [ -f *.srt ] 2>/dev/null; then
+          # Also move any stray .srt from root (just in case)
+          if ls *.srt 1> /dev/null 2>&1; then
             mv *.srt downloads/
           fi
+          echo "Contents of downloads folder before commit:"
+          ls -la downloads/
           git add downloads/
           git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename || 'subtitles-only' }} [skip ci]" || echo "Nothing to commit"
           git push
 
-      # ---------- UPLOAD TO RELEASES (handles both modes) ----------
+      # ---------- UPLOAD TO RELEASES ----------
       - name: 📤 Upload to GitHub Releases
         if: github.event.inputs.upload_method == 'release (GitHub Releases)'
         uses: softprops/action-gh-release@v2
@@ -293,15 +308,12 @@ jobs:
           tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
           name: ${{ steps.retrieve.outputs.mode == 'subtitles_only' && format('Subtitles - {0}', github.event.inputs.video_url) || format('YouTube - {0}', steps.retrieve.outputs.filename) }}
           body: |
-            **📽️ YouTube Download**
+            **YouTube Download**
 
             **URL:** ${{ github.event.inputs.video_url }}
             **Mode:** ${{ github.event.inputs.download_mode }}
             ${{ steps.retrieve.outputs.subtitle_saved == 'true' && '**🔤 Subtitles:** English subtitles are attached as .srt file.' || '' }}
             **Downloaded on:** ${{ steps.get_date.outputs.date }}
-
-            ---
-            Powered by Enhanced YouTube Action
           files: release_files/*
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
