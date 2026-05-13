@@ -1,4 +1,4 @@
-name: YouTube Downloader Pro (Fixed Subtitles)
+name: YouTube Downloader Pro (yt-dlp Subtitles)
 
 on:
   workflow_dispatch:
@@ -80,16 +80,13 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y zip curl python3 python3-pip
-          # Pin to a stable version of youtube_transcript_api
-          pip3 install --quiet requests youtube_transcript_api==0.6.1
+          pip3 install --quiet requests yt-dlp
 
-      - name: 🧠 Process Video & Subtitles
+      - name: 🧠 Process Video & Download Subtitles (yt-dlp)
         id: retrieve
         run: |
           python3 << 'EOF'
-          import os, sys, time, re, requests
-          from youtube_transcript_api import YouTubeTranscriptApi
-          from youtube_transcript_api.formatters import SRTFormatter
+          import os, sys, time, re, requests, subprocess
 
           URL = os.environ.get('INPUT_URL')
           MODE = os.environ.get('INPUT_MODE')
@@ -102,36 +99,39 @@ jobs:
               sys.exit(1)
           video_id = vid_match[1]
 
-          # ---------- SUBTITLE DOWNLOAD (Fixed for library version 0.6.1) ----------
-          subtitle_filename = None
           subtitle_saved = False
+          subtitle_filename = None
 
+          # ---------- SUBTITLE DOWNLOAD USING yt-dlp (reliable) ----------
           if GET_SUB or MODE == 'subtitles only':
               try:
-                  # Use the old working API (version 0.6.1)
-                  transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                  # Try to get English transcript (manual or auto-generated)
-                  transcript = None
-                  try:
-                      transcript = transcript_list.find_transcript(['en'])
-                  except:
-                      # If no English, take the first available
-                      for t in transcript_list:
-                          transcript = t
+                  # Run yt-dlp to fetch only subtitles
+                  # Output template: video_id.en.srt
+                  subprocess.run([
+                      "yt-dlp",
+                      "--write-subs",
+                      "--write-auto-subs",
+                      "--sub-langs", "en.*,en",
+                      "--sub-format", "srt/best",
+                      "--skip-download",
+                      "--no-warnings",
+                      "-o", f"{video_id}",
+                      URL
+                  ], check=True, capture_output=True, text=True)
+
+                  # Check for the created .srt file (yt-dlp may name it .en.srt)
+                  possible_names = [f"{video_id}.en.srt", f"{video_id}.srt", f"{video_id}_en.srt"]
+                  for name in possible_names:
+                      if os.path.exists(name):
+                          subtitle_filename = f"{video_id}_en.srt"
+                          os.rename(name, subtitle_filename)
+                          subtitle_saved = True
+                          print(f"✅ Subtitles saved as {subtitle_filename}")
                           break
-                  if transcript:
-                      srt_formatter = SRTFormatter()
-                      srt_content = srt_formatter.format_transcript(transcript.fetch())
-                      subtitle_filename = f"{video_id}_en.srt"
-                      with open(subtitle_filename, 'w', encoding='utf-8') as f:
-                          f.write(srt_content)
-                      subtitle_saved = True
-                      print(f"✅ Subtitles saved as {subtitle_filename}")
-                      print(f"✅ File size: {os.path.getsize(subtitle_filename)} bytes")
-                  else:
-                      raise Exception("No transcript found")
+                  if not subtitle_saved:
+                      raise Exception("No subtitle file created by yt-dlp")
               except Exception as e:
-                  print(f"⚠️ Could not download subtitles: {e}")
+                  print(f"⚠️ Could not download subtitles with yt-dlp: {e}")
                   if MODE == 'subtitles only':
                       print("::error::Subtitles not available and mode requires only subtitles.")
                       sys.exit(1)
@@ -149,7 +149,7 @@ jobs:
               print("Subtitle-only mode finished.")
               sys.exit(0)
 
-          # ---------- VIDEO/AUDIO MODE ----------
+          # ---------- VIDEO/AUDIO MODE (using external API) ----------
           FMT = os.environ.get('INPUT_FORMAT')
           QUAL = os.environ.get('INPUT_QUALITY')
           is_audio = FMT == 'mp3'
@@ -158,7 +158,6 @@ jobs:
           else:
               QUAL = QUAL if QUAL in ('720p','1080p') else '720p'
 
-          # Contact external API for download link
           payload = {
               "url": URL,
               "os": "linux",
@@ -199,7 +198,6 @@ jobs:
           clean = clean.lstrip('-')
           fname = f"{clean}_{video_id}_{QUAL}.{FMT}"
 
-          # Write all info to file
           with open(".download_info", "w", encoding="utf-8") as f:
               f.write(f"{dl_url}\n{fname}\n{title}\n")
               f.write(f"mode=video\n")
@@ -234,11 +232,11 @@ jobs:
             exit 1
           fi
 
-      # ---------- FORCE MOVE SUBTITLES TO release_files ----------
+      # ---------- MOVE SUBTITLES TO release_files ----------
       - name: 📝 Move Subtitles to release_files
         run: |
           mkdir -p release_files
-          # Look for any .srt file in the current directory
+          # Find any .srt file in current directory (created by yt-dlp)
           for srt in *.srt; do
             if [ -f "$srt" ]; then
               echo "Found subtitle file: $srt"
@@ -293,11 +291,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           mkdir -p downloads
-          # Move everything from release_files to downloads
           if [ -d release_files ] && [ "$(ls -A release_files)" ]; then
             mv release_files/* downloads/
           fi
-          # Also move any stray .srt from root (just in case)
           if ls *.srt 1> /dev/null 2>&1; then
             mv *.srt downloads/
           fi
