@@ -1,10 +1,10 @@
-name: دانلودر یوتیوب (چند لینکی)
+name: دانلودر یوتیوب (چند لینکی با کاما)
 
 on:
   workflow_dispatch:
     inputs:
       video_urls:
-        description: 'YouTube video URLs (یک لینک در هر خط)'
+        description: 'YouTube video URLs (جدا شده با کاما , )'
         required: true
         type: string
 
@@ -71,14 +71,14 @@ jobs:
           import os, sys, time, re, requests, subprocess
           from pathlib import Path
 
-          # Read inputs
+          # Read input – split by commas, strip spaces
           urls_text = os.environ.get('INPUT_URLS', '')
-          urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+          urls = [u.strip() for u in urls_text.split(',') if u.strip()]
           if not urls:
               print("::error::No URLs provided")
               sys.exit(1)
 
-          fmt = os.environ.get('INPUT_FORMAT', 'mp4')          # 'mp4' or 'mp3'
+          fmt = os.environ.get('INPUT_FORMAT', 'mp4')
           qual = os.environ.get('INPUT_QUALITY', '720p')
           threshold_mb = int(os.environ.get('INPUT_MAX_MB', '90'))
           if threshold_mb <= 0 or threshold_mb > 1900:
@@ -101,12 +101,11 @@ jobs:
           session.get("https://media.ytmp3.gg/")
 
           total = len(urls)
-          downloaded_files = []   # store (filename, title)
+          downloaded_files = []
           first_title = ""
 
           for idx, url in enumerate(urls, 1):
               print(f"\n=== Processing [{idx}/{total}]: {url} ===")
-              # 1. Get download link
               payload = {
                   "url": url,
                   "os": "linux",
@@ -148,7 +147,6 @@ jobs:
                   print(f"::error::Could not get download link for {url}")
                   continue
 
-              # 2. Build safe filename
               vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
               vid = vid_match[1] if vid_match else "unknown"
               clean_title = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
@@ -157,7 +155,6 @@ jobs:
               filename = f"{clean_title}_{vid}_{qual}.{fmt}"
               filepath = out_dir / filename
 
-              # 3. Download
               print(f"Downloading {filename} ...")
               try:
                   rdl = session.get(dl_url, stream=True, timeout=120)
@@ -169,7 +166,6 @@ jobs:
                   print(f"::error::Download failed for {filename}: {e}")
                   continue
 
-              # 4. Split if needed
               filesize = filepath.stat().st_size
               if filesize > threshold_bytes:
                   print(f"File size {filesize//(1024*1024)}MB > {threshold_mb}MB, splitting...")
@@ -180,20 +176,18 @@ jobs:
                       cwd=str(out_dir), check=True
                   )
                   filepath.unlink()
-                  # Record the zip part(s) - we just note that it was split
                   downloaded_files.append((f"{base}.zip (split)", title))
               else:
                   downloaded_files.append((filename, title))
               print(f"✅ Done: {title}")
 
-          # Write summary to file and set outputs
+          # Write summary
           summary_file = out_dir / "summary.txt"
           with open(summary_file, 'w', encoding='utf-8') as sf:
               sf.write(f"Total files: {len(downloaded_files)}\n")
               for fname, title in downloaded_files:
                   sf.write(f"{fname} : {title}\n")
 
-          # Set output for first filename and count
           first_fname = downloaded_files[0][0] if downloaded_files else ""
           count = len(downloaded_files)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
@@ -220,7 +214,6 @@ jobs:
           mkdir -p downloads
           mv release_files/* downloads/
           git add downloads/
-          # Dynamic commit message: first title + count
           COUNT="${{ steps.process.outputs.file_count }}"
           FIRST="${{ steps.process.outputs.first_title }}"
           if [ "$COUNT" -eq 1 ]; then
@@ -247,4 +240,15 @@ jobs:
             **Format:** ${{ github.event.inputs.output_format }}
             **Downloaded on:** ${{ steps.get_date.outputs.date }}
 
-            **Files included:**
+            **All files are attached below.**
+            ---
+            Powered by Meli-Action ⚡
+          files: release_files/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: rm -rf release_files 2>/dev/null || true
+EOF
