@@ -135,12 +135,20 @@ jobs:
                   for chunk in rdl.iter_content(chunk_size=8192):
                       f.write(chunk)
 
+              # ========== FIXED SPLITTING CODE ==========
               if filepath.stat().st_size > max_bytes:
-                  base = filepath.stem
-                  zip_name = out_dir / f"{base}.zip"
-                  subprocess.run(["zip", "-r", "-s", f"{max_mb}m", str(zip_name), str(filepath)], cwd=out_dir, check=True)
-                  filepath.unlink()
-              print(f"Done: {title}")
+                  print(f"Splitting {filename} into {max_mb}MB parts...")
+                  original_cwd = os.getcwd()
+                  os.chdir(out_dir)                     # go into release_files/
+                  base_name = filepath.stem
+                  zip_cmd = ["zip", "-r", "-s", f"{max_mb}m", f"{base_name}.zip", filename]
+                  subprocess.run(zip_cmd, check=True)
+                  filepath.unlink()                     # remove original
+                  os.chdir(original_cwd)                # return to root
+                  print(f"Split completed: {base_name}.zip, .z01, ...")
+              else:
+                  print(f"No split needed ({filepath.stat().st_size // (1024*1024)} MB)")
+              # =========================================
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"count={len(titles)}\n")
