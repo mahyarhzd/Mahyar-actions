@@ -1,15 +1,15 @@
-name: دانلودر یوتیوب (چند لینکی با کاما)
+name: YouTube Downloader (comma separated)
 
 on:
   workflow_dispatch:
     inputs:
       video_urls:
-        description: 'YouTube video URLs (جدا شده با کاما , )'
+        description: 'YouTube URLs separated by commas (e.g., url1, url2, url3)'
         required: true
         type: string
 
       output_format:
-        description: 'نوع خروجی'
+        description: 'Output format'
         required: true
         type: choice
         options:
@@ -18,19 +18,19 @@ on:
         default: 'mp4 (video)'
 
       desired_quality:
-        description: 'کیفیت (ویدیو: 720p, 1080p | صدا: 192kbps, 320kbps)'
+        description: 'Quality (video: 720p, 1080p | audio: 192kbps, 320kbps)'
         required: false
         type: string
         default: '720p'
 
       max_part_mb:
-        description: 'حداکثر حجم هر قسمت (MB) - 0 = خودکار ۱۸۰۰ مگابایت'
+        description: 'Max part size in MB (0 = auto 1800 MB)'
         required: false
         type: string
         default: '90'
 
       upload_method:
-        description: '📤 روش ذخیره نهایی'
+        description: 'Upload method'
         required: true
         type: choice
         options:
@@ -39,7 +39,7 @@ on:
         default: 'repository (push to repo)'
 
       release_tag:
-        description: '🏷️ نام تگ ریلیز (فقط در صورت انتخاب Release)'
+        description: 'Release tag (only when using Releases)'
         required: false
         type: string
         default: ''
@@ -53,25 +53,24 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: 📂 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🔧 Install Dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y zip curl python3 python3-pip
           pip3 install --quiet requests
 
-      - name: 📥 Download & Split All Videos
+      - name: Download and Process Videos
         id: process
         run: |
           python3 << 'EOF'
           import os, sys, time, re, requests, subprocess
           from pathlib import Path
 
-          # Read input – split by commas, strip spaces
           urls_text = os.environ.get('INPUT_URLS', '')
           urls = [u.strip() for u in urls_text.split(',') if u.strip()]
           if not urls:
@@ -100,12 +99,11 @@ jobs:
           session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
           session.get("https://media.ytmp3.gg/")
 
-          total = len(urls)
           downloaded_files = []
-          first_title_raw = ""
+          first_title = ""
 
           for idx, url in enumerate(urls, 1):
-              print(f"\n=== Processing [{idx}/{total}]: {url} ===")
+              print(f"Processing [{idx}/{len(urls)}]: {url}")
               payload = {
                   "url": url,
                   "os": "linux",
@@ -121,13 +119,13 @@ jobs:
                   resp.raise_for_status()
                   data = resp.json()
               except Exception as e:
-                  print(f"::error::API request failed for {url}: {e}")
+                  print(f"::error::API error for {url}: {e}")
                   continue
 
               status_url = data.get('statusUrl')
               title = data.get('title', 'video')
-              if not first_title_raw:
-                  first_title_raw = title
+              if not first_title:
+                  first_title = title
 
               dl_url = None
               for _ in range(150):
@@ -139,20 +137,17 @@ jobs:
                           dl_url = status.get('downloadUrl')
                           break
                       if status.get('status') == 'failed':
-                          print(f"::error::Server failed to prepare {url}")
                           break
                   except:
                       pass
               if not dl_url:
-                  print(f"::error::Could not get download link for {url}")
+                  print(f"::error::No download link for {url}")
                   continue
 
               vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
               vid = vid_match[1] if vid_match else "unknown"
-              # Safer filename: remove all non-alphanumeric except dot, hyphen, underscore
-              safe_title = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF\-_]', '_', title.replace(' ', '_'))
+              safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
               safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:60] or vid
-              safe_title = safe_title.lstrip('-')
               filename = f"{safe_title}_{vid}_{qual}.{fmt}"
               filepath = out_dir / filename
 
@@ -164,12 +159,10 @@ jobs:
                       for chunk in rdl.iter_content(chunk_size=8192):
                           f.write(chunk)
               except Exception as e:
-                  print(f"::error::Download failed for {filename}: {e}")
+                  print(f"::error::Download failed: {e}")
                   continue
 
-              filesize = filepath.stat().st_size
-              if filesize > threshold_bytes:
-                  print(f"File size {filesize//(1024*1024)}MB > {threshold_mb}MB, splitting...")
+              if filepath.stat().st_size > threshold_bytes:
                   base = filepath.stem
                   zip_name = out_dir / f"{base}.zip"
                   subprocess.run(
@@ -177,79 +170,55 @@ jobs:
                       cwd=str(out_dir), check=True
                   )
                   filepath.unlink()
-                  downloaded_files.append((f"{base}.zip (split)", title))
+                  downloaded_files.append(f"{base}.zip")
               else:
-                  downloaded_files.append((filename, title))
-              print(f"✅ Done: {title}")
+                  downloaded_files.append(filename)
+              print(f"Done: {title}")
 
-          # Sanitize first_title for safe use in shell and YAML
-          # Remove quotes, backticks, dollar signs, semicolons, etc.
-          safe_title_for_output = re.sub(r'["\'`$;\\]', '', first_title_raw)
-          safe_title_for_output = safe_title_for_output.replace('\n', ' ').strip()
-
-          first_fname = downloaded_files[0][0] if downloaded_files else ""
           count = len(downloaded_files)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
-              gh_out.write(f"first_filename={first_fname}\n")
-              gh_out.write(f"first_title={safe_title_for_output}\n")
-              gh_out.write(f"file_count={count}\n")
-          print(f"Downloaded {count} items. First: {first_fname}")
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"file_count={count}\n")
+              f.write(f"first_title={first_title}\n")
           EOF
         env:
-          INPUT_URLS:   ${{ github.event.inputs.video_urls }}
+          INPUT_URLS: ${{ github.event.inputs.video_urls }}
           INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
           INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
           INPUT_MAX_MB: ${{ github.event.inputs.max_part_mb }}
 
-      - name: 📅 Get Current Date
-        id: get_date
+      - name: Get Date
+        id: date
         run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
 
-      - name: 📤 Push to Repository
+      - name: Push to Repository
         if: github.event.inputs.upload_method == 'repository (push to repo)'
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           mkdir -p downloads
           mv release_files/* downloads/
           git add downloads/
-          COUNT="${{ steps.process.outputs.file_count }}"
-          FIRST="${{ steps.process.outputs.first_title }}"
-          # Properly escape the commit message using printf %q
-          if [ "$COUNT" -eq 1 ]; then
-            MSG="⬇️ YouTube: $FIRST"
-          else
-            MSG="⬇️ YouTube batch: $FIRST + $((COUNT-1)) more"
-          fi
-          # Use a subshell to safely pass the message
-          git commit -m "$(echo "$MSG" | sed 's/[\"\\`\$]/\\&/g') [skip ci]" || echo "Nothing to commit"
+          git commit -m "Download YouTube videos [skip ci]" || echo "Nothing to commit"
           git push
 
-      - name: 📤 Upload to GitHub Releases
+      - name: Upload to GitHub Releases
         if: github.event.inputs.upload_method == 'release (GitHub Releases)'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
-          name: ${{ steps.process.outputs.file_count == 1 && format('YouTube - {0}', steps.process.outputs.first_title) || format('YouTube Batch ({0} videos) - {1}', steps.process.outputs.file_count, steps.process.outputs.first_title) }}
+          name: YouTube Download - ${{ steps.process.outputs.first_title }}
           body: |
-            **📽️ YouTube Download**
-
-            **${{ steps.process.outputs.file_count == 1 && 'Video' || 'Batch download' }}**
-            ${{ steps.process.outputs.file_count > 1 && format('Number of videos: {0}', steps.process.outputs.file_count) || '' }}
-            **First title:** ${{ steps.process.outputs.first_title }}
-            **Quality:** ${{ github.event.inputs.desired_quality }}
-            **Format:** ${{ github.event.inputs.output_format }}
-            **Downloaded on:** ${{ steps.get_date.outputs.date }}
-
-            **All files are attached below.**
-            ---
-            Powered by Meli-Action ⚡
+            **YouTube Download**
+            Number of files: ${{ steps.process.outputs.file_count }}
+            Quality: ${{ github.event.inputs.desired_quality }}
+            Format: ${{ github.event.inputs.output_format }}
+            Date: ${{ steps.date.outputs.date }}
           files: release_files/*
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
           prerelease: false
 
-      - name: 🧹 Cleanup
+      - name: Cleanup
         if: always()
-        run: rm -rf release_files 2>/dev/null || true
+        run: rm -rf release_files
 EOF
