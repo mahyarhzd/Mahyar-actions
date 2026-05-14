@@ -86,7 +86,6 @@ jobs:
           threshold_bytes = threshold_mb * 1024 * 1024
 
           is_audio = (fmt == 'mp3')
-          # Quality validation
           if is_audio:
               if qual not in ('64kbps','128kbps','192kbps','320kbps'):
                   qual = '192kbps'
@@ -94,19 +93,20 @@ jobs:
               if qual not in ('720p','1080p'):
                   qual = '720p'
 
-          # Prepare output directory
           out_dir = Path("release_files")
           out_dir.mkdir(exist_ok=True)
 
-          # Session reused for all downloads
           session = requests.Session()
           session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
           session.get("https://media.ytmp3.gg/")
 
           total = len(urls)
+          downloaded_files = []   # store (filename, title)
+          first_title = ""
+
           for idx, url in enumerate(urls, 1):
               print(f"\n=== Processing [{idx}/{total}]: {url} ===")
-              # 1. Get download link from API
+              # 1. Get download link
               payload = {
                   "url": url,
                   "os": "linux",
@@ -127,6 +127,9 @@ jobs:
 
               status_url = data.get('statusUrl')
               title = data.get('title', 'video')
+              if not first_title:
+                  first_title = title
+
               dl_url = None
               for _ in range(150):
                   time.sleep(2)
@@ -154,7 +157,7 @@ jobs:
               filename = f"{clean_title}_{vid}_{qual}.{fmt}"
               filepath = out_dir / filename
 
-              # 3. Download file
+              # 3. Download
               print(f"Downloading {filename} ...")
               try:
                   rdl = session.get(dl_url, stream=True, timeout=120)
@@ -166,23 +169,38 @@ jobs:
                   print(f"::error::Download failed for {filename}: {e}")
                   continue
 
-              # 4. Split if too large
+              # 4. Split if needed
               filesize = filepath.stat().st_size
               if filesize > threshold_bytes:
                   print(f"File size {filesize//(1024*1024)}MB > {threshold_mb}MB, splitting...")
                   base = filepath.stem
                   zip_name = out_dir / f"{base}.zip"
-                  # Use zip split (create multi‑part zip archive)
                   subprocess.run(
                       ["zip", "-r", "-s", f"{threshold_mb}m", str(zip_name), str(filepath)],
                       cwd=str(out_dir), check=True
                   )
-                  filepath.unlink()  # remove original
-                  print(f"Split into parts: {out_dir}/")
+                  filepath.unlink()
+                  # Record the zip part(s) - we just note that it was split
+                  downloaded_files.append((f"{base}.zip (split)", title))
               else:
-                  print(f"No split needed ({filesize//(1024*1024)} MB)")
+                  downloaded_files.append((filename, title))
+              print(f"✅ Done: {title}")
 
-          print("All downloads processed.")
+          # Write summary to file and set outputs
+          summary_file = out_dir / "summary.txt"
+          with open(summary_file, 'w', encoding='utf-8') as sf:
+              sf.write(f"Total files: {len(downloaded_files)}\n")
+              for fname, title in downloaded_files:
+                  sf.write(f"{fname} : {title}\n")
+
+          # Set output for first filename and count
+          first_fname = downloaded_files[0][0] if downloaded_files else ""
+          count = len(downloaded_files)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+              gh_out.write(f"first_filename={first_fname}\n")
+              gh_out.write(f"first_title={first_title}\n")
+              gh_out.write(f"file_count={count}\n")
+          print(f"Downloaded {count} items. First: {first_fname}")
           EOF
         env:
           INPUT_URLS:   ${{ github.event.inputs.video_urls }}
@@ -202,7 +220,15 @@ jobs:
           mkdir -p downloads
           mv release_files/* downloads/
           git add downloads/
-          git commit -m "⬇️ YouTube batch download [skip ci]" || echo "Nothing to commit"
+          # Dynamic commit message: first title + count
+          COUNT="${{ steps.process.outputs.file_count }}"
+          FIRST="${{ steps.process.outputs.first_title }}"
+          if [ "$COUNT" -eq 1 ]; then
+            MSG="⬇️ YouTube: $FIRST"
+          else
+            MSG="⬇️ YouTube batch: $FIRST + $((COUNT-1)) more"
+          fi
+          git commit -m "$MSG [skip ci]" || echo "Nothing to commit"
           git push
 
       - name: 📤 Upload to GitHub Releases
@@ -210,23 +236,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
-          name: "YouTube Batch - ${{ github.run_number }}"
+          name: ${{ steps.process.outputs.file_count == 1 && format('YouTube - {0}', steps.process.outputs.first_title) || format('YouTube Batch ({0} videos) - {1}', steps.process.outputs.file_count, steps.process.outputs.first_title) }}
           body: |
-            **📽️ YouTube Batch Download**
+            **📽️ YouTube Download**
 
-            **Number of videos:** (see assets)
+            **${{ steps.process.outputs.file_count == 1 && 'Video' || 'Batch download' }}**
+            ${{ steps.process.outputs.file_count > 1 && format('Number of videos: {0}', steps.process.outputs.file_count) || '' }}
+            **First title:** ${{ steps.process.outputs.first_title }}
             **Quality:** ${{ github.event.inputs.desired_quality }}
             **Format:** ${{ github.event.inputs.output_format }}
             **Downloaded on:** ${{ steps.get_date.outputs.date }}
 
-            ---
-            Powered by Meli-Action ⚡
-          files: release_files/*
-          token: ${{ secrets.GITHUB_TOKEN }}
-          draft: false
-          prerelease: false
-
-      - name: 🧹 Cleanup
-        if: always()
-        run: rm -rf release_files .download_info 2>/dev/null || true
-EOF
+            **Files included:**
