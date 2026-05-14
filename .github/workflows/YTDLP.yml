@@ -89,70 +89,99 @@ jobs:
           session.headers.update({"User-Agent": "Mozilla/5.0"})
           session.get("https://media.ytmp3.gg/")
 
-          titles = []
+          successful_titles = []
+          failed_urls = []
+
           for url in urls:
-              print(f"Processing: {url}")
-              payload = {
-                  "url": url,
-                  "os": "linux",
-                  "output": {"type": "audio" if is_audio else "video", "format": fmt}
-              }
-              if is_audio:
-                  payload["audio"] = {"bitrate": qual}
-              else:
-                  payload["output"]["quality"] = qual
+              try:
+                  print(f"\nProcessing: {url}")
+                  # Skip live URLs early (common cause of 400)
+                  if '/live/' in url or '?list=' in url or '&list=' in url:
+                      print(f"⚠️ Skipping likely live/playlist URL: {url}")
+                      failed_urls.append(url)
+                      continue
 
-              resp = session.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
-              resp.raise_for_status()
-              data = resp.json()
-              status_url = data['statusUrl']
-              title = data.get('title', 'video')
-              titles.append(title)
+                  payload = {
+                      "url": url,
+                      "os": "linux",
+                      "output": {"type": "audio" if is_audio else "video", "format": fmt}
+                  }
+                  if is_audio:
+                      payload["audio"] = {"bitrate": qual}
+                  else:
+                      payload["output"]["quality"] = qual
 
-              dl_url = None
-              for _ in range(150):
-                  time.sleep(2)
-                  r = session.get(status_url, timeout=20)
-                  status = r.json()
-                  if status.get('status') == 'completed':
-                      dl_url = status.get('downloadUrl')
-                      break
-                  if status.get('status') == 'failed':
-                      break
-              if not dl_url:
-                  print(f"::error::Failed to get link for {url}")
+                  resp = session.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+                  resp.raise_for_status()
+                  data = resp.json()
+                  status_url = data['statusUrl']
+                  title = data.get('title', 'video')
+                  successful_titles.append(title)
+
+                  dl_url = None
+                  for _ in range(150):
+                      time.sleep(2)
+                      r = session.get(status_url, timeout=20)
+                      status = r.json()
+                      if status.get('status') == 'completed':
+                          dl_url = status.get('downloadUrl')
+                          break
+                      if status.get('status') == 'failed':
+                          break
+                  if not dl_url:
+                      print(f"⚠️ Could not get download link for {url}")
+                      failed_urls.append(url)
+                      continue
+
+                  vid = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
+                  if vid:
+                      vid = vid.group(1)
+                  else:
+                      # fallback for youtu.be/xxxx or youtu.be/xxxx?si=...
+                      vid_match = re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', url)
+                      vid = vid_match.group(1) if vid_match else "unknown"
+
+                  safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
+                  safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:60]
+                  filename = f"{safe_title}_{vid}_{qual}.{fmt}"
+                  filepath = out_dir / filename
+
+                  rdl = session.get(dl_url, stream=True, timeout=120)
+                  rdl.raise_for_status()
+                  with open(filepath, 'wb') as f:
+                      for chunk in rdl.iter_content(chunk_size=8192):
+                          f.write(chunk)
+
+                  # Splitting
+                  if filepath.stat().st_size > max_bytes:
+                      print(f"Splitting {filename} into {max_mb}MB parts...")
+                      original_cwd = os.getcwd()
+                      os.chdir(out_dir)
+                      base_name = Path(filename).stem
+                      zip_cmd = ["zip", "-r", "-s", f"{max_mb}m", f"{base_name}.zip", filename]
+                      subprocess.run(zip_cmd, check=True)
+                      Path(filename).unlink()
+                      os.chdir(original_cwd)
+                      print(f"Split completed: {base_name}.zip, .z01, ...")
+                  else:
+                      print(f"No split needed ({filepath.stat().st_size // (1024*1024)} MB)")
+
+              except Exception as e:
+                  print(f"⚠️ Error processing {url}: {e}")
+                  failed_urls.append(url)
                   continue
 
-              vid = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url).group(1)
-              safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
-              safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:60]
-              filename = f"{safe_title}_{vid}_{qual}.{fmt}"
-              filepath = out_dir / filename
-
-              rdl = session.get(dl_url, stream=True, timeout=120)
-              rdl.raise_for_status()
-              with open(filepath, 'wb') as f:
-                  for chunk in rdl.iter_content(chunk_size=8192):
-                      f.write(chunk)
-
-              # ========== FIXED SPLITTING CODE ==========
-              if filepath.stat().st_size > max_bytes:
-                  print(f"Splitting {filename} into {max_mb}MB parts...")
-                  original_cwd = os.getcwd()
-                  os.chdir(out_dir)                     # go into release_files/
-                  base_name = Path(filename).stem       # filename without extension
-                  zip_cmd = ["zip", "-r", "-s", f"{max_mb}m", f"{base_name}.zip", filename]
-                  subprocess.run(zip_cmd, check=True)
-                  Path(filename).unlink()               # delete original using just filename
-                  os.chdir(original_cwd)                # return to repo root
-                  print(f"Split completed: {base_name}.zip, .z01, ...")
-              else:
-                  print(f"No split needed ({filepath.stat().st_size // (1024*1024)} MB)")
-              # =========================================
-
+          # Write outputs
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"count={len(titles)}\n")
-              f.write(f"first_title={titles[0] if titles else ''}\n")
+              f.write(f"count={len(successful_titles)}\n")
+              f.write(f"first_title={successful_titles[0] if successful_titles else 'None'}\n")
+              f.write(f"failed={','.join(failed_urls)}\n")
+
+          if failed_urls:
+              print(f"\n⚠️ The following URLs failed: {failed_urls}")
+          if not successful_titles:
+              print("::error::No videos were downloaded successfully")
+              sys.exit(1)
           PYTHON
         env:
           INPUT_URLS: ${{ github.event.inputs.video_urls }}
@@ -166,10 +195,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "bot@github.com"
           mkdir -p downloads
-          mv release_files/* downloads/
-          git add downloads/
-          git commit -m "Download YouTube videos [skip ci]" || echo "No changes"
-          git push
+          if [ -d release_files ] && [ "$(ls -A release_files)" ]; then
+            mv release_files/* downloads/
+            git add downloads/
+            git commit -m "Download YouTube videos [skip ci]" || echo "No changes"
+            git push
+          else
+            echo "No files to push"
+          fi
 
       - name: Create Release
         if: github.event.inputs.upload_method == 'release'
@@ -181,8 +214,11 @@ jobs:
             Downloaded ${{ steps.process.outputs.count }} video(s)
             Format: ${{ github.event.inputs.output_format }}
             Quality: ${{ github.event.inputs.desired_quality }}
+            Failed URLs: ${{ steps.process.outputs.failed }}
           files: release_files/*
           token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
 
       - name: Cleanup
         if: always()
