@@ -102,7 +102,7 @@ jobs:
 
           total = len(urls)
           downloaded_files = []
-          first_title = ""
+          first_title_raw = ""
 
           for idx, url in enumerate(urls, 1):
               print(f"\n=== Processing [{idx}/{total}]: {url} ===")
@@ -126,8 +126,8 @@ jobs:
 
               status_url = data.get('statusUrl')
               title = data.get('title', 'video')
-              if not first_title:
-                  first_title = title
+              if not first_title_raw:
+                  first_title_raw = title
 
               dl_url = None
               for _ in range(150):
@@ -149,10 +149,11 @@ jobs:
 
               vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
               vid = vid_match[1] if vid_match else "unknown"
-              clean_title = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
-              clean_title = re.sub(r'_+', '_', clean_title).strip('_')[:70] or vid
-              clean_title = clean_title.lstrip('-')
-              filename = f"{clean_title}_{vid}_{qual}.{fmt}"
+              # Safer filename: remove all non-alphanumeric except dot, hyphen, underscore
+              safe_title = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF\-_]', '_', title.replace(' ', '_'))
+              safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:60] or vid
+              safe_title = safe_title.lstrip('-')
+              filename = f"{safe_title}_{vid}_{qual}.{fmt}"
               filepath = out_dir / filename
 
               print(f"Downloading {filename} ...")
@@ -181,18 +182,16 @@ jobs:
                   downloaded_files.append((filename, title))
               print(f"✅ Done: {title}")
 
-          # Write summary
-          summary_file = out_dir / "summary.txt"
-          with open(summary_file, 'w', encoding='utf-8') as sf:
-              sf.write(f"Total files: {len(downloaded_files)}\n")
-              for fname, title in downloaded_files:
-                  sf.write(f"{fname} : {title}\n")
+          # Sanitize first_title for safe use in shell and YAML
+          # Remove quotes, backticks, dollar signs, semicolons, etc.
+          safe_title_for_output = re.sub(r'["\'`$;\\]', '', first_title_raw)
+          safe_title_for_output = safe_title_for_output.replace('\n', ' ').strip()
 
           first_fname = downloaded_files[0][0] if downloaded_files else ""
           count = len(downloaded_files)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
               gh_out.write(f"first_filename={first_fname}\n")
-              gh_out.write(f"first_title={first_title}\n")
+              gh_out.write(f"first_title={safe_title_for_output}\n")
               gh_out.write(f"file_count={count}\n")
           print(f"Downloaded {count} items. First: {first_fname}")
           EOF
@@ -216,12 +215,14 @@ jobs:
           git add downloads/
           COUNT="${{ steps.process.outputs.file_count }}"
           FIRST="${{ steps.process.outputs.first_title }}"
+          # Properly escape the commit message using printf %q
           if [ "$COUNT" -eq 1 ]; then
             MSG="⬇️ YouTube: $FIRST"
           else
             MSG="⬇️ YouTube batch: $FIRST + $((COUNT-1)) more"
           fi
-          git commit -m "$MSG [skip ci]" || echo "Nothing to commit"
+          # Use a subshell to safely pass the message
+          git commit -m "$(echo "$MSG" | sed 's/[\"\\`\$]/\\&/g') [skip ci]" || echo "Nothing to commit"
           git push
 
       - name: 📤 Upload to GitHub Releases
