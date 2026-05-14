@@ -1,25 +1,16 @@
-name: YouTube Downloader Pro (yt-dlp Subtitles)
+name: دانلودر یوتیوب (چند لینکی)
 
 on:
   workflow_dispatch:
     inputs:
-      video_url:
-        description: 'YouTube video URL'
+      video_urls:
+        description: 'YouTube video URLs (یک لینک در هر خط)'
         required: true
         type: string
 
-      download_mode:
-        description: 'What to download?'
-        required: true
-        type: choice
-        options:
-          - video/audio + subtitles (if available)
-          - subtitles only (no video/audio)
-        default: 'video/audio + subtitles (if available)'
-
       output_format:
-        description: 'Output format (only for video/audio mode)'
-        required: false
+        description: 'نوع خروجی'
+        required: true
         type: choice
         options:
           - mp4 (video)
@@ -27,19 +18,19 @@ on:
         default: 'mp4 (video)'
 
       desired_quality:
-        description: 'Quality: 720p/1080p for video, 192/320kbps for audio'
+        description: 'کیفیت (ویدیو: 720p, 1080p | صدا: 192kbps, 320kbps)'
         required: false
         type: string
         default: '720p'
 
       max_part_mb:
-        description: 'Max size per part (MB) - 0 = auto 1800 MB (ignored for subtitles-only)'
+        description: 'حداکثر حجم هر قسمت (MB) - 0 = خودکار ۱۸۰۰ مگابایت'
         required: false
         type: string
         default: '90'
 
       upload_method:
-        description: '📤 Final storage method'
+        description: '📤 روش ذخیره نهایی'
         required: true
         type: choice
         options:
@@ -48,19 +39,10 @@ on:
         default: 'repository (push to repo)'
 
       release_tag:
-        description: '🏷️ Release tag name (if Release method is chosen)'
+        description: '🏷️ نام تگ ریلیز (فقط در صورت انتخاب Release)'
         required: false
         type: string
         default: ''
-
-      download_subtitles:
-        description: 'Download English subtitles? (ignored if mode is subtitles-only)'
-        required: false
-        type: choice
-        options:
-          - 'no'
-          - 'yes, as .srt file'
-        default: 'yes, as .srt file'
 
 permissions:
   contents: write
@@ -80,243 +62,165 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y zip curl python3 python3-pip
-          pip3 install --quiet requests yt-dlp
+          pip3 install --quiet requests
 
-      - name: 🧠 Process Video & Download Subtitles (yt-dlp)
-        id: retrieve
+      - name: 📥 Download & Split All Videos
+        id: process
         run: |
           python3 << 'EOF'
           import os, sys, time, re, requests, subprocess
+          from pathlib import Path
 
-          URL = os.environ.get('INPUT_URL')
-          MODE = os.environ.get('INPUT_MODE')
-          GET_SUB = os.environ.get('INPUT_SUBTITLES') == 'yes, as .srt file'
-
-          # Extract video ID
-          vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)
-          if not vid_match:
-              print("::error::Could not extract video ID from URL")
+          # Read inputs
+          urls_text = os.environ.get('INPUT_URLS', '')
+          urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+          if not urls:
+              print("::error::No URLs provided")
               sys.exit(1)
-          video_id = vid_match[1]
 
-          subtitle_saved = False
-          subtitle_filename = None
+          fmt = os.environ.get('INPUT_FORMAT', 'mp4')          # 'mp4' or 'mp3'
+          qual = os.environ.get('INPUT_QUALITY', '720p')
+          threshold_mb = int(os.environ.get('INPUT_MAX_MB', '90'))
+          if threshold_mb <= 0 or threshold_mb > 1900:
+              threshold_mb = 1800
+          threshold_bytes = threshold_mb * 1024 * 1024
 
-          # ---------- SUBTITLE DOWNLOAD USING yt-dlp (reliable) ----------
-          if GET_SUB or MODE == 'subtitles only':
+          is_audio = (fmt == 'mp3')
+          # Quality validation
+          if is_audio:
+              if qual not in ('64kbps','128kbps','192kbps','320kbps'):
+                  qual = '192kbps'
+          else:
+              if qual not in ('720p','1080p'):
+                  qual = '720p'
+
+          # Prepare output directory
+          out_dir = Path("release_files")
+          out_dir.mkdir(exist_ok=True)
+
+          # Session reused for all downloads
+          session = requests.Session()
+          session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+          session.get("https://media.ytmp3.gg/")
+
+          total = len(urls)
+          for idx, url in enumerate(urls, 1):
+              print(f"\n=== Processing [{idx}/{total}]: {url} ===")
+              # 1. Get download link from API
+              payload = {
+                  "url": url,
+                  "os": "linux",
+                  "output": {"type": "audio" if is_audio else "video", "format": fmt}
+              }
+              if is_audio:
+                  payload["audio"] = {"bitrate": qual}
+              else:
+                  payload["output"]["quality"] = qual
+
               try:
-                  # Run yt-dlp to fetch only subtitles
-                  # Output template: video_id.en.srt
-                  subprocess.run([
-                      "yt-dlp",
-                      "--write-subs",
-                      "--write-auto-subs",
-                      "--sub-langs", "en.*,en",
-                      "--sub-format", "srt/best",
-                      "--skip-download",
-                      "--no-warnings",
-                      "-o", f"{video_id}",
-                      URL
-                  ], check=True, capture_output=True, text=True)
-
-                  # Check for the created .srt file (yt-dlp may name it .en.srt)
-                  possible_names = [f"{video_id}.en.srt", f"{video_id}.srt", f"{video_id}_en.srt"]
-                  for name in possible_names:
-                      if os.path.exists(name):
-                          subtitle_filename = f"{video_id}_en.srt"
-                          os.rename(name, subtitle_filename)
-                          subtitle_saved = True
-                          print(f"✅ Subtitles saved as {subtitle_filename}")
-                          break
-                  if not subtitle_saved:
-                      raise Exception("No subtitle file created by yt-dlp")
+                  resp = session.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+                  resp.raise_for_status()
+                  data = resp.json()
               except Exception as e:
-                  print(f"⚠️ Could not download subtitles with yt-dlp: {e}")
-                  if MODE == 'subtitles only':
-                      print("::error::Subtitles not available and mode requires only subtitles.")
-                      sys.exit(1)
+                  print(f"::error::API request failed for {url}: {e}")
+                  continue
 
-          # If mode is subtitles only, we are done
-          if MODE == 'subtitles only':
-              with open(".download_info", "w") as f:
-                  f.write("SUBTITLES_ONLY\n")
-                  f.write(f"subtitle_saved={subtitle_saved}\n")
-                  if subtitle_saved:
-                      f.write(f"subtitle_filename={subtitle_filename}\n")
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-                  f.write("mode=subtitles_only\n")
-                  f.write(f"subtitle_saved={'true' if subtitle_saved else 'false'}\n")
-              print("Subtitle-only mode finished.")
-              sys.exit(0)
+              status_url = data.get('statusUrl')
+              title = data.get('title', 'video')
+              dl_url = None
+              for _ in range(150):
+                  time.sleep(2)
+                  try:
+                      r = session.get(status_url, timeout=20)
+                      status = r.json()
+                      if status.get('status') == 'completed':
+                          dl_url = status.get('downloadUrl')
+                          break
+                      if status.get('status') == 'failed':
+                          print(f"::error::Server failed to prepare {url}")
+                          break
+                  except:
+                      pass
+              if not dl_url:
+                  print(f"::error::Could not get download link for {url}")
+                  continue
 
-          # ---------- VIDEO/AUDIO MODE (using external API) ----------
-          FMT = os.environ.get('INPUT_FORMAT')
-          QUAL = os.environ.get('INPUT_QUALITY')
-          is_audio = FMT == 'mp3'
-          if is_audio:
-              QUAL = QUAL if QUAL in ('64kbps','128kbps','192kbps','320kbps') else '192kbps'
-          else:
-              QUAL = QUAL if QUAL in ('720p','1080p') else '720p'
+              # 2. Build safe filename
+              vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
+              vid = vid_match[1] if vid_match else "unknown"
+              clean_title = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+              clean_title = re.sub(r'_+', '_', clean_title).strip('_')[:70] or vid
+              clean_title = clean_title.lstrip('-')
+              filename = f"{clean_title}_{vid}_{qual}.{fmt}"
+              filepath = out_dir / filename
 
-          payload = {
-              "url": URL,
-              "os": "linux",
-              "output": {"type": "audio" if is_audio else "video", "format": FMT}
-          }
-          if is_audio:
-              payload["audio"] = {"bitrate": QUAL}
-          else:
-              payload["output"]["quality"] = QUAL
+              # 3. Download file
+              print(f"Downloading {filename} ...")
+              try:
+                  rdl = session.get(dl_url, stream=True, timeout=120)
+                  rdl.raise_for_status()
+                  with open(filepath, 'wb') as f:
+                      for chunk in rdl.iter_content(chunk_size=8192):
+                          f.write(chunk)
+              except Exception as e:
+                  print(f"::error::Download failed for {filename}: {e}")
+                  continue
 
-          s = requests.Session()
-          s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-          s.get("https://media.ytmp3.gg/")
-          resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
-          resp.raise_for_status()
-          data = resp.json()
+              # 4. Split if too large
+              filesize = filepath.stat().st_size
+              if filesize > threshold_bytes:
+                  print(f"File size {filesize//(1024*1024)}MB > {threshold_mb}MB, splitting...")
+                  base = filepath.stem
+                  zip_name = out_dir / f"{base}.zip"
+                  # Use zip split (create multi‑part zip archive)
+                  subprocess.run(
+                      ["zip", "-r", "-s", f"{threshold_mb}m", str(zip_name), str(filepath)],
+                      cwd=str(out_dir), check=True
+                  )
+                  filepath.unlink()  # remove original
+                  print(f"Split into parts: {out_dir}/")
+              else:
+                  print(f"No split needed ({filesize//(1024*1024)} MB)")
 
-          status_url = data.get('statusUrl')
-          title = data.get('title', 'video')
-          dl_url = None
-          for _ in range(150):
-              time.sleep(2)
-              r = s.get(status_url, timeout=20)
-              status = r.json()
-              if status.get('status') == 'completed':
-                  dl_url = status.get('downloadUrl')
-                  break
-              if status.get('status') == 'failed':
-                  print("::error::Server failed to prepare the video")
-                  sys.exit(1)
-
-          if not dl_url:
-              print("::error::Could not get download link")
-              sys.exit(1)
-
-          clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
-          clean = re.sub(r'_+', '_', clean).strip('_')[:70] or video_id
-          clean = clean.lstrip('-')
-          fname = f"{clean}_{video_id}_{QUAL}.{FMT}"
-
-          with open(".download_info", "w", encoding="utf-8") as f:
-              f.write(f"{dl_url}\n{fname}\n{title}\n")
-              f.write(f"mode=video\n")
-              f.write(f"subtitle_saved={subtitle_saved}\n")
-              if subtitle_saved:
-                  f.write(f"subtitle_filename={subtitle_filename}\n")
-
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"filename={fname}\n")
-              f.write(f"title={title}\n")
-              f.write("mode=video\n")
-              f.write(f"subtitle_saved={'true' if subtitle_saved else 'false'}\n")
+          print("All downloads processed.")
           EOF
         env:
-          INPUT_URL:         ${{ github.event.inputs.video_url }}
-          INPUT_MODE:        ${{ github.event.inputs.download_mode }}
-          INPUT_FORMAT:      ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
-          INPUT_QUALITY:     ${{ github.event.inputs.desired_quality }}
-          INPUT_SUBTITLES:   ${{ github.event.inputs.download_subtitles }}
-
-      # ---------- DOWNLOAD VIDEO/AUDIO ----------
-      - name: 📥 Download File
-        if: steps.retrieve.outputs.mode != 'subtitles_only'
-        run: |
-          DL_URL=$(head -1 .download_info)
-          FILENAME=$(sed -n '2p' .download_info)
-          mkdir -p release_files
-          echo "Downloading: $FILENAME"
-          curl -L --fail --progress-bar -o "release_files/$FILENAME" "$DL_URL"
-          if [ ! -s "release_files/$FILENAME" ]; then
-            echo "::error::Downloaded file is empty!"
-            exit 1
-          fi
-
-      # ---------- MOVE SUBTITLES TO release_files ----------
-      - name: 📝 Move Subtitles to release_files
-        run: |
-          mkdir -p release_files
-          # Find any .srt file in current directory (created by yt-dlp)
-          for srt in *.srt; do
-            if [ -f "$srt" ]; then
-              echo "Found subtitle file: $srt"
-              mv "$srt" release_files/
-              echo "Moved to release_files/"
-            fi
-          done
-          # Also check .download_info for stored filename
-          if grep -q "subtitle_filename=" .download_info 2>/dev/null; then
-            SUB_FILE=$(grep "subtitle_filename=" .download_info | cut -d'=' -f2)
-            if [ -f "$SUB_FILE" ]; then
-              echo "Moving from stored filename: $SUB_FILE"
-              mv "$SUB_FILE" release_files/
-            fi
-          fi
-          echo "Contents of release_files after moving subtitles:"
-          ls -la release_files/
-
-      # ---------- SPLIT LARGE FILE (if needed) ----------
-      - name: ✂️ Split Large File (if needed)
-        if: steps.retrieve.outputs.mode != 'subtitles_only'
-        run: |
-          FILENAME="${{ steps.retrieve.outputs.filename }}"
-          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
-          if [[ "$THRESH_MB" -le 0 ]] || [[ "$THRESH_MB" -gt 1900 ]]; then
-            THRESH_MB=1800
-          fi
-          FILESIZE=$(stat -c%s "release_files/$FILENAME" 2>/dev/null || echo 0)
-          THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
-
-          if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
-            echo "🔪 Splitting into ${THRESH_MB}MB parts..."
-            BASE="${FILENAME%.*}"
-            cd release_files
-            zip -r -s "${THRESH_MB}m" "${BASE}.zip" "./$FILENAME"
-            rm -- "$FILENAME"
-            cd ..
-            echo "Parts created:"
-            ls -lh release_files/
-          else
-            echo "📦 No split needed ($(( FILESIZE / 1024 / 1024 )) MB)"
-          fi
+          INPUT_URLS:   ${{ github.event.inputs.video_urls }}
+          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
+          INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
+          INPUT_MAX_MB: ${{ github.event.inputs.max_part_mb }}
 
       - name: 📅 Get Current Date
         id: get_date
         run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
 
-      # ---------- PUSH TO REPOSITORY ----------
       - name: 📤 Push to Repository
         if: github.event.inputs.upload_method == 'repository (push to repo)'
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           mkdir -p downloads
-          if [ -d release_files ] && [ "$(ls -A release_files)" ]; then
-            mv release_files/* downloads/
-          fi
-          if ls *.srt 1> /dev/null 2>&1; then
-            mv *.srt downloads/
-          fi
-          echo "Contents of downloads folder before commit:"
-          ls -la downloads/
+          mv release_files/* downloads/
           git add downloads/
-          git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename || 'subtitles-only' }} [skip ci]" || echo "Nothing to commit"
+          git commit -m "⬇️ YouTube batch download [skip ci]" || echo "Nothing to commit"
           git push
 
-      # ---------- UPLOAD TO RELEASES ----------
       - name: 📤 Upload to GitHub Releases
         if: github.event.inputs.upload_method == 'release (GitHub Releases)'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
-          name: ${{ steps.retrieve.outputs.mode == 'subtitles_only' && format('Subtitles - {0}', github.event.inputs.video_url) || format('YouTube - {0}', steps.retrieve.outputs.filename) }}
+          name: "YouTube Batch - ${{ github.run_number }}"
           body: |
-            **YouTube Download**
+            **📽️ YouTube Batch Download**
 
-            **URL:** ${{ github.event.inputs.video_url }}
-            **Mode:** ${{ github.event.inputs.download_mode }}
-            ${{ steps.retrieve.outputs.subtitle_saved == 'true' && '**🔤 Subtitles:** English subtitles are attached as .srt file.' || '' }}
+            **Number of videos:** (see assets)
+            **Quality:** ${{ github.event.inputs.desired_quality }}
+            **Format:** ${{ github.event.inputs.output_format }}
             **Downloaded on:** ${{ steps.get_date.outputs.date }}
+
+            ---
+            Powered by Meli-Action ⚡
           files: release_files/*
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
@@ -324,4 +228,5 @@ jobs:
 
       - name: 🧹 Cleanup
         if: always()
-        run: rm -rf release_files .download_info *.srt 2>/dev/null || true
+        run: rm -rf release_files .download_info 2>/dev/null || true
+EOF
