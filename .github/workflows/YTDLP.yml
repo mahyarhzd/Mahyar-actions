@@ -1,45 +1,40 @@
-name: YouTube Downloader (comma separated)
+name: YouTube Batch Downloader
 
 on:
   workflow_dispatch:
     inputs:
       video_urls:
-        description: 'YouTube URLs separated by commas (e.g., url1, url2, url3)'
+        description: 'YouTube URLs separated by commas (example: url1, url2, url3)'
         required: true
         type: string
-
       output_format:
-        description: 'Output format'
+        description: 'Format'
         required: true
         type: choice
         options:
           - mp4 (video)
-          - mp3 (audio only)
+          - mp3 (audio)
         default: 'mp4 (video)'
-
       desired_quality:
-        description: 'Quality (video: 720p, 1080p | audio: 192kbps, 320kbps)'
+        description: 'Quality (video:720p/1080p, audio:192kbps/320kbps)'
         required: false
         type: string
         default: '720p'
-
       max_part_mb:
-        description: 'Max part size in MB (0 = auto 1800 MB)'
+        description: 'Max part size in MB (0=auto 1800)'
         required: false
         type: string
         default: '90'
-
       upload_method:
         description: 'Upload method'
         required: true
         type: choice
         options:
-          - repository (push to repo)
-          - release (GitHub Releases)
-        default: 'repository (push to repo)'
-
+          - repository
+          - release
+        default: 'repository'
       release_tag:
-        description: 'Release tag (only when using Releases)'
+        description: 'Release tag (only for release method)'
         required: false
         type: string
         default: ''
@@ -48,62 +43,55 @@ permissions:
   contents: write
 
 jobs:
-  youtube-download:
+  download:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Dependencies
+      - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y zip curl python3 python3-pip
           pip3 install --quiet requests
 
-      - name: Download and Process Videos
+      - name: Download all videos
         id: process
         run: |
-          python3 << 'EOF'
+          python3 << 'PYTHON'
           import os, sys, time, re, requests, subprocess
           from pathlib import Path
 
-          urls_text = os.environ.get('INPUT_URLS', '')
-          urls = [u.strip() for u in urls_text.split(',') if u.strip()]
+          urls = [u.strip() for u in os.environ['INPUT_URLS'].split(',') if u.strip()]
           if not urls:
-              print("::error::No URLs provided")
+              print("::error::No URLs")
               sys.exit(1)
 
-          fmt = os.environ.get('INPUT_FORMAT', 'mp4')
-          qual = os.environ.get('INPUT_QUALITY', '720p')
-          threshold_mb = int(os.environ.get('INPUT_MAX_MB', '90'))
-          if threshold_mb <= 0 or threshold_mb > 1900:
-              threshold_mb = 1800
-          threshold_bytes = threshold_mb * 1024 * 1024
+          fmt = os.environ['INPUT_FORMAT']
+          qual = os.environ['INPUT_QUALITY']
+          max_mb = int(os.environ['INPUT_MAX_MB'])
+          if max_mb <= 0 or max_mb > 1900:
+              max_mb = 1800
+          max_bytes = max_mb * 1024 * 1024
 
           is_audio = (fmt == 'mp3')
-          if is_audio:
-              if qual not in ('64kbps','128kbps','192kbps','320kbps'):
-                  qual = '192kbps'
-          else:
-              if qual not in ('720p','1080p'):
-                  qual = '720p'
+          if is_audio and qual not in ('64kbps','128kbps','192kbps','320kbps'):
+              qual = '192kbps'
+          if not is_audio and qual not in ('720p','1080p'):
+              qual = '720p'
 
           out_dir = Path("release_files")
           out_dir.mkdir(exist_ok=True)
 
           session = requests.Session()
-          session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+          session.headers.update({"User-Agent": "Mozilla/5.0"})
           session.get("https://media.ytmp3.gg/")
 
-          downloaded_files = []
-          first_title = ""
-
-          for idx, url in enumerate(urls, 1):
-              print(f"Processing [{idx}/{len(urls)}]: {url}")
+          titles = []
+          for url in urls:
+              print(f"Processing: {url}")
               payload = {
                   "url": url,
                   "os": "linux",
@@ -114,111 +102,80 @@ jobs:
               else:
                   payload["output"]["quality"] = qual
 
-              try:
-                  resp = session.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
-                  resp.raise_for_status()
-                  data = resp.json()
-              except Exception as e:
-                  print(f"::error::API error for {url}: {e}")
-                  continue
-
-              status_url = data.get('statusUrl')
+              resp = session.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+              resp.raise_for_status()
+              data = resp.json()
+              status_url = data['statusUrl']
               title = data.get('title', 'video')
-              if not first_title:
-                  first_title = title
+              titles.append(title)
 
               dl_url = None
               for _ in range(150):
                   time.sleep(2)
-                  try:
-                      r = session.get(status_url, timeout=20)
-                      status = r.json()
-                      if status.get('status') == 'completed':
-                          dl_url = status.get('downloadUrl')
-                          break
-                      if status.get('status') == 'failed':
-                          break
-                  except:
-                      pass
+                  r = session.get(status_url, timeout=20)
+                  status = r.json()
+                  if status.get('status') == 'completed':
+                      dl_url = status.get('downloadUrl')
+                      break
+                  if status.get('status') == 'failed':
+                      break
               if not dl_url:
-                  print(f"::error::No download link for {url}")
+                  print(f"::error::Failed to get link for {url}")
                   continue
 
-              vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
-              vid = vid_match[1] if vid_match else "unknown"
+              vid = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url).group(1)
               safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
-              safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:60] or vid
+              safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:60]
               filename = f"{safe_title}_{vid}_{qual}.{fmt}"
               filepath = out_dir / filename
 
-              print(f"Downloading {filename} ...")
-              try:
-                  rdl = session.get(dl_url, stream=True, timeout=120)
-                  rdl.raise_for_status()
-                  with open(filepath, 'wb') as f:
-                      for chunk in rdl.iter_content(chunk_size=8192):
-                          f.write(chunk)
-              except Exception as e:
-                  print(f"::error::Download failed: {e}")
-                  continue
+              rdl = session.get(dl_url, stream=True, timeout=120)
+              rdl.raise_for_status()
+              with open(filepath, 'wb') as f:
+                  for chunk in rdl.iter_content(chunk_size=8192):
+                      f.write(chunk)
 
-              if filepath.stat().st_size > threshold_bytes:
+              if filepath.stat().st_size > max_bytes:
                   base = filepath.stem
                   zip_name = out_dir / f"{base}.zip"
-                  subprocess.run(
-                      ["zip", "-r", "-s", f"{threshold_mb}m", str(zip_name), str(filepath)],
-                      cwd=str(out_dir), check=True
-                  )
+                  subprocess.run(["zip", "-r", "-s", f"{max_mb}m", str(zip_name), str(filepath)], cwd=out_dir, check=True)
                   filepath.unlink()
-                  downloaded_files.append(f"{base}.zip")
-              else:
-                  downloaded_files.append(filename)
               print(f"Done: {title}")
 
-          count = len(downloaded_files)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"file_count={count}\n")
-              f.write(f"first_title={first_title}\n")
-          EOF
+              f.write(f"count={len(titles)}\n")
+              f.write(f"first_title={titles[0] if titles else ''}\n")
+          PYTHON
         env:
           INPUT_URLS: ${{ github.event.inputs.video_urls }}
-          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
+          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio)' && 'mp3' || 'mp4' }}
           INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
           INPUT_MAX_MB: ${{ github.event.inputs.max_part_mb }}
 
-      - name: Get Date
-        id: date
-        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
-
-      - name: Push to Repository
-        if: github.event.inputs.upload_method == 'repository (push to repo)'
+      - name: Push to repo
+        if: github.event.inputs.upload_method == 'repository'
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "bot@github.com"
           mkdir -p downloads
           mv release_files/* downloads/
           git add downloads/
-          git commit -m "Download YouTube videos [skip ci]" || echo "Nothing to commit"
+          git commit -m "Download YouTube videos [skip ci]" || echo "No changes"
           git push
 
-      - name: Upload to GitHub Releases
-        if: github.event.inputs.upload_method == 'release (GitHub Releases)'
+      - name: Create Release
+        if: github.event.inputs.upload_method == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
-          name: YouTube Download - ${{ steps.process.outputs.first_title }}
+          tag_name: ${{ github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
+          name: YouTube Batch - ${{ steps.process.outputs.first_title }}
           body: |
-            **YouTube Download**
-            Number of files: ${{ steps.process.outputs.file_count }}
-            Quality: ${{ github.event.inputs.desired_quality }}
+            Downloaded ${{ steps.process.outputs.count }} video(s)
             Format: ${{ github.event.inputs.output_format }}
-            Date: ${{ steps.date.outputs.date }}
+            Quality: ${{ github.event.inputs.desired_quality }}
           files: release_files/*
           token: ${{ secrets.GITHUB_TOKEN }}
-          draft: false
-          prerelease: false
 
       - name: Cleanup
         if: always()
         run: rm -rf release_files
-EOF
